@@ -76,8 +76,8 @@ mcp.run(transport="streamable-http", host="127.0.0.1", port=8000, path="/mcp")
 
 ### 关卡地图解析
 
-> 所需数据来自 [Kengxxiao/ArknightsGameData](https://github.com/Kengxxiao/ArknightsGameData)，
-> 关卡 JSON 位于 `zh_CN/gamedata/levels/` 目录下。
+> 所需数据来自 [yuanyan3060/ArknightsGameResource](https://github.com/yuanyan3060/ArknightsGameResource)，
+> 关卡 JSON 位于 `gamedata/levels/` 目录下。
 
 #### `parse_map`
 解析关卡 JSON 文件，输出文字地图、红蓝门坐标和关卡基本参数。
@@ -173,10 +173,11 @@ https://github.com/yuanyan3060/ArknightsGameResource
 克隆后所需文件路径：
 ```
 ArknightsGameData/
-├── zh_CN/gamedata/
-│   ├── levels/          ← 关卡 JSON（parse_map / get_level_enemies 使用）
-│   └── excel/
-│       └── enemy_database.json   ← 敌人数据库
+└── gamedata/
+    ├── levels/                        ← 关卡 JSON（parse_map / get_level_enemies 使用）
+    │   └── enemydata/
+    │       └── enemy_database.json   ← 敌人数据库
+    └── ...
 ```
 
 ---

@@ -4,8 +4,11 @@ Mon3tr-MCP — 明日方舟 MCP 工具集
 
 工具列表:
   搜索/抓取: bing_search · fetch_page · fetch_prts_wiki
+  游戏数据:  fetch_gamedata（按仓库相对路径从 GitHub 拉取，带缓存）
   地图解析:  parse_map · get_cell_info · get_map_legend
   敌人数据:  get_level_enemies · get_enemy_by_id
+  注: parse_map / get_level_enemies / get_enemy_by_id 均支持本地路径、完整 URL
+      或仓库相对路径（自动补全远端地址）
 """
 
 from __future__ import annotations
@@ -20,6 +23,12 @@ from typing import Optional
 import requests
 from bs4 import BeautifulSoup
 from mcp.server.fastmcp import FastMCP
+
+# ── 远端游戏数据源 ────────────────────────────────────────────────
+_GAMEDATA_BASE_URL = (
+    "https://raw.githubusercontent.com/Kengxxiao/ArknightsGameData/master/zh_CN"
+)
+_json_cache: dict = {}
 
 # ── Windows 控制台 UTF-8 输出修正 ────────────────────────────────
 if sys.platform == "win32":
@@ -114,6 +123,25 @@ def fetch_prts_wiki(character_name: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════
+# 通用 JSON 加载（本地路径 / HTTP URL，带内存缓存）
+# ══════════════════════════════════════════════════════════════════
+
+def _load_json(path_or_url: str) -> dict:
+    if path_or_url.startswith(("http://", "https://")):
+        if path_or_url not in _json_cache:
+            res = requests.get(path_or_url, timeout=15)
+            res.raise_for_status()
+            _json_cache[path_or_url] = res.json()
+        return _json_cache[path_or_url]
+    with Path(path_or_url).open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _is_accessible(path_or_url: str) -> bool:
+    return path_or_url.startswith(("http://", "https://")) or Path(path_or_url).is_file()
+
+
+# ══════════════════════════════════════════════════════════════════
 # 地图解析辅助函数
 # ══════════════════════════════════════════════════════════════════
 
@@ -128,6 +156,8 @@ _TILE_MAP = {
     "tile_fence_bound": "围",
 }
 
+_FLY_START_TILES = {"tile_flystart"}
+
 _CELL_DESC = {
     "禁": "禁入区 - 不可通行/不可部署",
     "高": "高台 - 可部署高台干员",
@@ -140,24 +170,22 @@ _CELL_DESC = {
     "进": "传送进入点",
     "出": "传送离开点",
     "围": "围墙 - 可部署围墙",
+    "飞": "飞行起点 - 飞行单位生成点",
     "?": "未知区域",
 }
 
 _LEVEL_TYPE_NAME = {0: "普通", 1: "精英", 2: "BOSS"}
 
 
-def _parse_arknights_map(json_file_path: str):
-    """解析明日方舟关卡 JSON，返回 (game_grid, blue_doors, red_doors, data)"""
-    path = Path(json_file_path)
-    with path.open("r", encoding="utf-8") as f:
-        data = json.load(f)
-
+def _parse_arknights_map_data(data: dict):
+    """解析已加载的关卡 JSON dict，返回 (game_grid, blue_doors, red_doors, fly_doors, data)"""
     map_matrix = data["mapData"]["map"]
     tiles = data["mapData"]["tiles"]
     rows = len(map_matrix)
     cols = len(map_matrix[0])
 
     grid = [["?" for _ in range(cols)] for _ in range(rows)]
+    fly_start_points: set = set()
 
     for y in range(rows):
         for x in range(cols):
@@ -165,7 +193,16 @@ def _parse_arknights_map(json_file_path: str):
             tile_key = tiles[tile_index].get("tileKey") if tile_index < len(tiles) else None
             if tile_key in _TILE_MAP:
                 grid[rows - y - 1][x] = _TILE_MAP[tile_key]
+            elif tile_key in _FLY_START_TILES:
+                fly_start_points.add((y, x))
             # tile_start / tile_end 留作 '?' 占位，后续被门覆盖
+
+    # 标记预设装置（在标记门之前，确保门的排除条件能正确检查 '装'）
+    if "predefines" in data and "tokenInsts" in data["predefines"]:
+        for token in data["predefines"]["tokenInsts"]:
+            r = token["position"]["row"]
+            c = token["position"]["col"]
+            grid[r][c] = "装"
 
     blue_doors: set = set()
     for route in data.get("routes", []):
@@ -185,11 +222,9 @@ def _parse_arknights_map(json_file_path: str):
                 grid[sr][sc] = "红"
                 red_doors.add((sr, sc))
 
-    if "predefines" in data and "tokenInsts" in data["predefines"]:
-        for token in data["predefines"]["tokenInsts"]:
-            r = token["position"]["row"]
-            c = token["position"]["col"]
-            grid[r][c] = "装"
+    # 标记飞行单位生成点（覆盖红门）
+    for fy, fx in fly_start_points:
+        grid[rows - fy - 1][fx] = "飞"
 
     # 坐标系翻转：game_grid[0] 对应屏幕上方
     game_grid = [["?" for _ in range(cols)] for _ in range(rows)]
@@ -197,7 +232,10 @@ def _parse_arknights_map(json_file_path: str):
         for col in range(cols):
             game_grid[rows - 1 - row][col] = grid[row][col]
 
-    return game_grid, blue_doors, red_doors, data
+    # fly_start_points 是 JSON 坐标，转为与 blue_doors/red_doors 一致的格式
+    fly_doors = {(rows - 1 - fy, fx) for fy, fx in fly_start_points}
+
+    return game_grid, blue_doors, red_doors, fly_doors, data
 
 
 def _build_text_map(game_grid, blue_doors, red_doors) -> str:
@@ -210,14 +248,15 @@ def _build_text_map(game_grid, blue_doors, red_doors) -> str:
             if rows - 1 - r == y:
                 row_str += f" <- 红门({c},{rows-1-r})"
         lines.append(row_str)
+    x_width = max(len(str(cols - 1)), 2)
     x_axis = "        " + "".join(
-        (f"x={x} " if x < 10 else f"x={x}") for x in range(cols)
+        f"x={x}".ljust(x_width + 3) for x in range(cols)
     )
     lines.append(x_axis)
     lines.append("\n图例:")
     lines.append(
         "禁-禁入区 高-高台 路-可部署位 不-不可部署位 穴-地穴 "
-        "装-装置 蓝-防守点 红-侵入点 进-传送进入 出-传送离开 围-围墙"
+        "装-装置 蓝-防守点 红-侵入点 进-传送进入 出-传送离开 围-围墙 飞-飞行起点"
     )
     return "\n".join(lines)
 
@@ -233,29 +272,37 @@ def _get_cell_description(cell_type: str) -> str:
 @mcp.tool()
 def parse_map(json_file_path: str) -> str:
     """
-    解析明日方舟关卡 JSON 文件并返回文字地图及关卡基本信息。
+    解析明日方舟关卡 JSON 并返回文字地图及关卡基本信息。支持本地路径或 URL。
 
     参数:
-        json_file_path: 关卡 JSON 文件的绝对或相对路径
+        json_file_path: 关卡 JSON 的本地路径或完整 URL。
+                        也可传入仓库相对路径（如 gamedata/levels/obt/main/level_main_01-08.json），
+                        将自动拼接远端地址。
 
     返回:
         文字地图 + 红/蓝门坐标 + 关卡选项信息
     """
-    if not Path(json_file_path).is_file():
-        return f"错误: 找不到文件 {json_file_path}"
+    if not json_file_path.startswith(("http://", "https://")):
+        if not Path(json_file_path).is_file():
+            # 尝试视作仓库相对路径从远端获取
+            json_file_path = f"{_GAMEDATA_BASE_URL}/{json_file_path.lstrip('/')}"
     try:
-        game_grid, blue_doors, red_doors, data = _parse_arknights_map(json_file_path)
+        data = _load_json(json_file_path)
+        game_grid, blue_doors, red_doors, fly_doors, data = _parse_arknights_map_data(data)
+    except requests.HTTPError as e:
+        return f"错误: 远端请求失败 {e}"
     except json.JSONDecodeError:
-        return f"错误: {json_file_path} 不是有效的 JSON 文件"
+        return f"错误: 不是有效的 JSON"
     except KeyError as e:
-        return f"错误: JSON 文件缺少必要字段 {e}"
+        return f"错误: JSON 缺少必要字段 {e}"
     except Exception as e:
-        return f"处理文件时发生错误: {e}"
+        return f"处理时发生错误: {e}"
 
     rows = len(game_grid)
     text_map = _build_text_map(game_grid, blue_doors, red_doors)
     blue_list = ", ".join(f"({c},{rows-1-r})" for r, c in sorted(blue_doors)) or "无"
     red_list  = ", ".join(f"({c},{rows-1-r})" for r, c in sorted(red_doors))  or "无"
+    fly_list  = ", ".join(f"({c},{rows-1-r})" for r, c in sorted(fly_doors)) or "无"
     opts = data.get("options", {})
     info_lines = [
         f"地图尺寸: {rows} 行 x {len(game_grid[0])} 列",
@@ -264,6 +311,7 @@ def parse_map(json_file_path: str) -> str:
         f"初始费用: {opts.get('initialCost', '未知')}",
         f"蓝门坐标: {blue_list}",
         f"红门坐标: {red_list}",
+        f"飞行起点坐标: {fly_list}",
     ]
     return text_map + "\n\n" + "\n".join(info_lines)
 
@@ -289,9 +337,8 @@ def get_map_legend() -> str:
 # 敌人数据辅助函数
 # ══════════════════════════════════════════════════════════════════
 
-def _load_enemy_db(db_path: str) -> dict:
-    with Path(db_path).open("r", encoding="utf-8") as f:
-        raw = json.load(f)
+def _load_enemy_db(db_path_or_url: str) -> dict:
+    raw = _load_json(db_path_or_url)
     return {entry["key"]: entry["value"] for entry in raw["enemies"]}
 
 
@@ -354,6 +401,10 @@ def _format_enemy(enemy_id: str, enemy_data: dict, data_level: int = 0) -> str:
     if lp is not None:
         lines.append(f"占用生命点: {lp}")
 
+    rr = _mv(enemy_data.get("rangeRadius"))
+    if rr:
+        lines.append(f"攻击半径: {rr}")
+
     stat_fields = [
         ("maxHp",            "生命值"),
         ("atk",              "攻击力"),
@@ -410,20 +461,25 @@ def _format_enemy(enemy_id: str, enemy_data: dict, data_level: int = 0) -> str:
 @mcp.tool()
 def get_level_enemies(level_json_path: str, enemy_db_path: str) -> str:
     """
-    读取关卡 JSON 的 enemyDbRefs，从 enemy_database.json 中查找对应敌人数据，
-    输出本关卡所有敌人的基础数据。
+    读取关卡 JSON 的 enemyDbRefs，从 enemy_database.json 中查找敌人数据。
+    两个参数均支持本地路径或 URL；也可传入仓库相对路径自动补全远端地址。
 
     参数:
-        level_json_path: 关卡 JSON 文件路径（如 level_main_01-08.json）
-        enemy_db_path:   enemy_database.json 的文件路径
+        level_json_path: 关卡 JSON 路径/URL（如 gamedata/levels/obt/main/level_main_01-08.json）
+        enemy_db_path:   enemy_database.json 路径/URL（如 gamedata/levels/enemydata/enemy_database.json）
     """
-    for p in (level_json_path, enemy_db_path):
-        if not Path(p).is_file():
-            return f"错误: 找不到文件 {p}"
+    def _resolve(p: str) -> str:
+        if p.startswith(("http://", "https://")) or Path(p).is_file():
+            return p
+        return f"{_GAMEDATA_BASE_URL}/{p.lstrip('/')}"
+
+    level_json_path = _resolve(level_json_path)
+    enemy_db_path   = _resolve(enemy_db_path)
     try:
-        with Path(level_json_path).open("r", encoding="utf-8") as f:
-            level_data = json.load(f)
-        enemy_db = _load_enemy_db(enemy_db_path)
+        level_data = _load_json(level_json_path)
+        enemy_db   = _load_enemy_db(enemy_db_path)
+    except requests.HTTPError as e:
+        return f"错误: 远端请求失败 {e}"
     except json.JSONDecodeError as e:
         return f"错误: JSON 解析失败 - {e}"
     except Exception as e:
@@ -461,17 +517,20 @@ def get_level_enemies(level_json_path: str, enemy_db_path: str) -> str:
 @mcp.tool()
 def get_enemy_by_id(enemy_id: str, enemy_db_path: str, level: int = 0) -> str:
     """
-    从 enemy_database.json 按 ID 查询单个敌人的数据。
+    从 enemy_database.json 按 ID 查询单个敌人的数据。支持本地路径或 URL。
 
     参数:
         enemy_id:      敌人 ID，如 enemy_1000_gopro
-        enemy_db_path: enemy_database.json 的文件路径
+        enemy_db_path: enemy_database.json 的路径/URL，或仓库相对路径
+                       （如 gamedata/levels/enemydata/enemy_database.json）
         level:         数据等级（默认 0；精英/BOSS 关卡可能有 level 1+）
     """
-    if not Path(enemy_db_path).is_file():
-        return f"错误: 找不到文件 {enemy_db_path}"
+    if not enemy_db_path.startswith(("http://", "https://")) and not Path(enemy_db_path).is_file():
+        enemy_db_path = f"{_GAMEDATA_BASE_URL}/{enemy_db_path.lstrip('/')}"
     try:
         enemy_db = _load_enemy_db(enemy_db_path)
+    except requests.HTTPError as e:
+        return f"错误: 远端请求失败 {e}"
     except Exception as e:
         return f"错误: {e}"
 
@@ -486,6 +545,108 @@ def get_enemy_by_id(enemy_id: str, enemy_db_path: str, level: int = 0) -> str:
         if diff_entry:
             base_data = _merge_enemy_data(base_data, diff_entry["enemyData"])
     return _format_enemy(enemy_id, base_data, data_level=level)
+
+
+# ══════════════════════════════════════════════════════════════════
+# 远端游戏数据获取工具
+# ══════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def fetch_gamedata(relative_path: str, max_chars: int = 3000) -> str:
+    """
+    从 GitHub 上的 ArknightsGameData 仓库（Kengxxiao/ArknightsGameData，zh_CN 分支）
+    按相对路径获取游戏数据文件，结果以 JSON 字符串返回（带缓存）。
+
+    参数:
+        relative_path: 仓库内相对路径，如
+                       gamedata/excel/character_table.json
+                       gamedata/excel/skill_table.json
+                       gamedata/levels/obt/main/level_main_01-08.json
+                       gamedata/levels/enemydata/enemy_database.json
+        max_chars:     返回内容最大字符数（默认 3000，大文件可调大）
+
+    返回:
+        JSON 字符串（超出 max_chars 时截断并提示）
+    """
+    url = f"{_GAMEDATA_BASE_URL}/{relative_path.lstrip('/')}"
+    try:
+        data = _load_json(url)
+    except requests.HTTPError as e:
+        return f"错误: 远端请求失败 {e}\n请求地址: {url}"
+    except Exception as e:
+        return f"错误: {e}"
+    content = json.dumps(data, ensure_ascii=False, indent=2)
+    if len(content) > max_chars:
+        return content[:max_chars] + f"\n\n...(已截断，完整长度 {len(content)} 字符，请增大 max_chars)"
+    return content
+
+
+# ══════════════════════════════════════════════════════════════════
+# 关卡查询工具
+# ══════════════════════════════════════════════════════════════════
+
+_STAGE_OVERVIEW_URL = (
+    "https://raw.githubusercontent.com/MaaAssistantArknights/"
+    "MaaAssistantArknights/dev-v2/resource/Arknights-Tile-Pos/overview.json"
+)
+_stage_overview_cache: Optional[dict] = None
+
+
+def _load_stage_overview() -> dict:
+    global _stage_overview_cache
+    if _stage_overview_cache is None:
+        res = requests.get(_STAGE_OVERVIEW_URL, timeout=15)
+        res.raise_for_status()
+        _stage_overview_cache = res.json()
+    return _stage_overview_cache
+
+
+@mcp.tool()
+def lookup_stage(query: str) -> str:
+    """
+    通过关卡代号、名称或 stageId 查询关卡信息及游戏数据文件路径。
+
+    参数:
+        query: 关卡代号（如 "1-7"、"CE-5"、"GT-1"）、
+               关卡名称（如 "当务之急"、"龙门外环"）或
+               stageId（如 "main_01-07"）
+
+    返回:
+        匹配的关卡列表，包含代号、名称、stageId、
+        游戏数据 JSON 路径（可用于 parse_map / fetch_gamedata）
+    """
+    try:
+        overview = _load_stage_overview()
+    except Exception as e:
+        return f"错误: 无法获取关卡数据表 {e}"
+
+    query_lower = query.lower().strip()
+    results = []
+    for entry in overview.values():
+        code = entry.get("code", "")
+        name = entry.get("name", "")
+        stage_id = entry.get("stageId", "")
+        if (query_lower in code.lower()
+                or query_lower in name
+                or query_lower in stage_id.lower()):
+            results.append(entry)
+
+    if not results:
+        return f"未找到匹配 '{query}' 的关卡"
+
+    lines = [f"找到 {len(results)} 个匹配关卡:", ""]
+    for e in results[:20]:
+        level_id = e.get("levelId", "")
+        json_path = f"gamedata/levels/{level_id}.json"
+        lines.append(f"  关卡代号: {e.get('code', '?')}")
+        lines.append(f"  名称:     {e.get('name', '?')}")
+        lines.append(f"  stageId:  {e.get('stageId', '?')}")
+        lines.append(f"  地图尺寸: {e.get('width', '?')} x {e.get('height', '?')}")
+        lines.append(f"  数据路径: {json_path}")
+        lines.append("")
+    if len(results) > 20:
+        lines.append(f"... 共 {len(results)} 条，仅显示前 20 条")
+    return "\n".join(lines)
 
 
 # ══════════════════════════════════════════════════════════════════

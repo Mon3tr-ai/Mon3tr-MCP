@@ -16,12 +16,12 @@ Hello Hello! 这里是可爱的 Mon3tr 哦，我来给博士们的 llm 赋予灵
 - 依赖包：
 
 ```bash
-pip install requests beautifulsoup4 mcp
+pip install requests beautifulsoup4 mcp python-docx
 ```
 
 > Termux 用户：
 > ```bash
-> pip install requests beautifulsoup4 mcp --break-system-packages
+> pip install requests beautifulsoup4 mcp python-docx --break-system-packages
 > ```
 
 ---
@@ -53,6 +53,7 @@ mcp.run(transport="streamable-http", host="127.0.0.1", port=8000, path="/mcp")
 |------|------|--------|------|
 | `query` | str | — | 搜索关键词 |
 | `num` | int | 10 | 返回结果数量 |
+| `domain` | str | `"cn.bing.com"` | Bing 域名，可选 `cn.bing.com`（国内版）或 `www.bing.com`（国际版） |
 
 ---
 
@@ -194,6 +195,28 @@ mcp.run(transport="streamable-http", host="127.0.0.1", port=8000, path="/mcp")
 | `level` | int | 0 | 数据等级（0 为基础，精英/BOSS 关卡可能有 level 1+） |
 
 输出包含：名称、描述、等级类型、占用生命点、基础属性（生命值/攻击力/防御力/法抗等）、免疫状态、技能列表。
+
+---
+
+### 干员档案生成
+
+#### `generate_operator_profile`
+从 prts.wiki 抓取干员信息，生成格式化的 DOCX 档案文档。包含基本信息、属性、天赋、技能等章节，表格带蓝色表头和灰色标签列。
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `operator_name` | str | — | 干员名称，如 `凯尔希·思衡托`、`Mon3tr`、`维什戴尔` |
+| `output_path` | str | `None` | 保存路径（含文件名），为 `None` 时保存到当前目录，自动创建不存在的目录 |
+
+输出示例：
+```
+文档已成功生成：C:\Users\...\Mon3tr 干员档案.docx
+```
+
+> 需额外安装 `python-docx`：
+> ```bash
+> pip install python-docx
+> ```
 
 ---
 

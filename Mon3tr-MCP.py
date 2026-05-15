@@ -51,15 +51,24 @@ _MOBILE_UA = (
 
 
 @mcp.tool()
-def bing_search(query: str, num: int = 10) -> str:
-    """用 Bing 搜索网页，返回标题、链接和摘要"""
+def bing_search(query: str, num: int = 10, domain: str = "cn.bing.com") -> str:
+    """
+    用 Bing 搜索网页，返回标题、链接和摘要。
+
+    参数:
+        query: 搜索关键词
+        num: 返回结果数量（默认10）
+        domain: Bing 域名，可选 "cn.bing.com"（国内版，默认）或 "www.bing.com"（国际版）
+    """
+    if domain not in ("cn.bing.com", "www.bing.com"):
+        domain = "cn.bing.com"
     headers = {
         "User-Agent": _MOBILE_UA,
         "Accept-Language": "zh-CN,zh;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Referer": "https://www.bing.com/",
+        "Referer": f"https://{domain}/",
     }
-    url = f"https://www.bing.com/search?q={query}&count={num}"
+    url = f"https://{domain}/search?q={query}&count={num}"
     res = requests.get(url, headers=headers, timeout=10)
     soup = BeautifulSoup(res.text, "html.parser")
     results = []
@@ -647,6 +656,251 @@ def lookup_stage(query: str) -> str:
     if len(results) > 20:
         lines.append(f"... 共 {len(results)} 条，仅显示前 20 条")
     return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════
+# 干员档案文档生成工具
+# ══════════════════════════════════════════════════════════════════
+
+def _set_cell_shading(cell, color):
+    """设置单元格背景色"""
+    from docx.oxml.ns import qn
+    shading_elm = cell._element.get_or_add_tcPr()
+    shading = shading_elm.makeelement(qn('w:shd'), {
+        qn('w:fill'): color,
+        qn('w:val'): 'clear'
+    })
+    shading_elm.append(shading)
+
+
+def _extract_operator_info(soup):
+    """从prts wiki页面提取干员信息"""
+    info = {
+        'name': '',
+        'gender': '',
+        'combat_experience': '',
+        'birthplace': '',
+        'birthday': '',
+        'race': '',
+        'height': '',
+        'infection_status': '',
+        'profession': '',
+        'sub_profession': '',
+        'redeploy_time': '',
+        'deploy_cost': '',
+        'block_count': '',
+        'attack_interval': '',
+        'faction': '',
+    }
+
+    # 获取页面文本
+    text = soup.get_text(separator='\n')
+
+    # 提取基本信息
+    patterns = {
+        'name': r'【代号】(.+)',
+        'gender': r'【性别】(.+)',
+        'combat_experience': r'【战斗经验】(.+)',
+        'birthplace': r'【出身地】(.+)',
+        'birthday': r'【生日】(.+)',
+        'race': r'【种族】(.+)',
+        'height': r'【身高】(.+)',
+        'infection_status': r'【矿石病感染情况】(.+)',
+    }
+
+    for key, pattern in patterns.items():
+        match = re.search(pattern, text)
+        if match:
+            info[key] = match.group(1).strip()
+
+    # 提取属性信息
+    attr_patterns = {
+        'redeploy_time': r'再部署时间\s*(\d+s)',
+        'deploy_cost': r'初始部署费用\s*(\d+→\d+)',
+        'block_count': r'阻挡数\s*(\d+)',
+        'attack_interval': r'攻击间隔\s*([\d.]+s)',
+        'faction': r'所属势力\s*(.+)',
+    }
+
+    for key, pattern in attr_patterns.items():
+        match = re.search(pattern, text)
+        if match:
+            info[key] = match.group(1).strip()
+
+    return info
+
+
+@mcp.tool()
+def generate_operator_profile(operator_name: str, output_path: Optional[str] = None) -> str:
+    """
+    生成干员档案DOCX文档。
+
+    参数:
+        operator_name: 干员名称（如 "凯尔希·思衡托"、"Mon3tr"、"维什戴尔"）
+        output_path: 保存路径（含文件名），为 None 时保存到当前目录
+
+    返回:
+        生成的DOCX文件路径
+    """
+    try:
+        from docx import Document
+        from docx.shared import Pt, RGBColor
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        from docx.enum.table import WD_TABLE_ALIGNMENT
+        from docx.oxml.ns import qn
+    except ImportError:
+        return "错误: 缺少 python-docx 库，请运行 'pip install python-docx' 安装"
+
+    # 获取prts wiki页面
+    url = f"https://prts.wiki/w/{operator_name}"
+    try:
+        res = requests.get(url, headers={"User-Agent": _MOBILE_UA}, timeout=15)
+        res.encoding = 'utf-8'
+        soup = BeautifulSoup(res.text, 'html.parser')
+    except Exception as e:
+        return f"错误: 无法获取页面 {e}"
+
+    # 检查页面是否存在
+    if '页面不存在' in res.text or '没有找到' in res.text:
+        return f"错误: 未找到干员 '{operator_name}'"
+
+    # 提取干员信息
+    info = _extract_operator_info(soup)
+
+    # 获取页面文本内容
+    content = soup.find('div', {'id': 'mw-content-text'})
+    if not content:
+        return "错误: 无法获取页面内容"
+
+    text = content.get_text(separator='\n')
+
+    # 创建文档
+    doc = Document()
+
+    # 设置默认字体
+    style = doc.styles['Normal']
+    style.font.name = '微软雅黑'
+    style.element.rPr.rFonts.set(qn('w:eastAsia'), '微软雅黑')
+    style.font.size = Pt(10.5)
+
+    # 标题
+    title = doc.add_heading(f'{operator_name} 干员档案', 0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    # 基本信息
+    doc.add_heading('基本信息', level=1)
+
+    # 基本信息表格
+    table = doc.add_table(rows=8, cols=2)
+    table.style = 'Table Grid'
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+
+    info_data = [
+        ('代号', info['name'] or operator_name),
+        ('性别', info['gender'] or '未知'),
+        ('战斗经验', info['combat_experience'] or '未知'),
+        ('出身地', info['birthplace'] or '未知'),
+        ('生日', info['birthday'] or '未知'),
+        ('种族', info['race'] or '未知'),
+        ('身高', info['height'] or '未知'),
+        ('矿石病感染情况', info['infection_status'] or '未知'),
+    ]
+
+    for i, (key, value) in enumerate(info_data):
+        row = table.rows[i]
+        row.cells[0].text = key
+        row.cells[1].text = value
+        _set_cell_shading(row.cells[0], 'E8E8E8')
+
+    doc.add_paragraph()
+
+    # 干员属性
+    doc.add_heading('干员属性', level=1)
+
+    # 从页面提取职业信息
+    profession_match = re.search(r'职业\s*(\w+)', text)
+    sub_profession_match = re.search(r'分支\s*(\w+)', text)
+
+    table = doc.add_table(rows=7, cols=2)
+    table.style = 'Table Grid'
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+
+    attr_data = [
+        ('职业', profession_match.group(1) if profession_match else '未知'),
+        ('分支', sub_profession_match.group(1) if sub_profession_match else '未知'),
+        ('再部署时间', info['redeploy_time'] or '未知'),
+        ('初始部署费用', info['deploy_cost'] or '未知'),
+        ('阻挡数', info['block_count'] or '未知'),
+        ('攻击间隔', info['attack_interval'] or '未知'),
+        ('所属势力', info['faction'] or '未知'),
+    ]
+
+    for i, (key, value) in enumerate(attr_data):
+        row = table.rows[i]
+        row.cells[0].text = key
+        row.cells[1].text = value
+        _set_cell_shading(row.cells[0], 'E8E8E8')
+
+    doc.add_paragraph()
+
+    # 提取并添加天赋信息
+    doc.add_heading('天赋', level=1)
+
+    # 查找天赋部分
+    talent_start = text.find('天赋')
+    if talent_start >= 0:
+        talent_text = text[talent_start:talent_start+2000]
+        # 简化处理：提取天赋名称和描述
+        talent_lines = talent_text.split('\n')
+        current_talent = None
+        for line in talent_lines[:30]:  # 限制行数
+            line = line.strip()
+            if not line:
+                continue
+            if '第一天赋' in line or '第二天赋' in line:
+                current_talent = line
+                doc.add_heading(line, level=2)
+            elif current_talent and len(line) > 10:
+                doc.add_paragraph(line)
+
+    doc.add_paragraph()
+
+    # 提取并添加技能信息
+    doc.add_heading('技能', level=1)
+
+    # 查找技能部分
+    skill_start = text.find('技能')
+    if skill_start >= 0:
+        skill_text = text[skill_start:skill_start+3000]
+        skill_lines = skill_text.split('\n')
+        current_skill = None
+        skill_count = 0
+        for line in skill_lines[:50]:  # 限制行数
+            line = line.strip()
+            if not line:
+                continue
+            if '技能1' in line or '技能2' in line or '技能3' in line:
+                current_skill = line
+                skill_count += 1
+                if skill_count <= 3:
+                    doc.add_heading(line, level=2)
+            elif current_skill and ('描述' in line or '攻击力' in line or '治疗' in line):
+                if len(line) > 10:
+                    doc.add_paragraph(line)
+
+    doc.add_paragraph()
+
+    # 保存文档
+    if output_path:
+        save_path = output_path
+    else:
+        save_path = f"{operator_name} 干员档案.docx"
+    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+    doc.save(save_path)
+
+    # 返回完整路径
+    full_path = os.path.abspath(save_path)
+    return f"文档已成功生成：{full_path}"
 
 
 # ══════════════════════════════════════════════════════════════════

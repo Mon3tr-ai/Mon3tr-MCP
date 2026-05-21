@@ -7,6 +7,9 @@ Mon3tr-MCP — 明日方舟 MCP 工具集
   游戏数据:  fetch_gamedata（按仓库相对路径从 GitHub 拉取，带缓存）
   地图解析:  parse_map · get_cell_info · get_map_legend
   敌人数据:  get_level_enemies · get_enemy_by_id
+  文档工具:  generate_operator_profile · edit_document · edit_excel · edit_pdf
+  干员查询:  query_operator
+  剧情工具:  query_story
   注: parse_map / get_level_enemies / get_enemy_by_id 均支持本地路径、完整 URL
       或仓库相对路径（自动补全远端地址）
 """
@@ -155,14 +158,17 @@ def _is_accessible(path_or_url: str) -> bool:
 # ══════════════════════════════════════════════════════════════════
 
 _TILE_MAP = {
-    "tile_forbidden":   "禁",
-    "tile_wall":        "高",
-    "tile_road":        "路",
-    "tile_floor":       "不",
-    "tile_hole":        "穴",
-    "tile_telin":       "进",
-    "tile_telout":      "出",
-    "tile_fence_bound": "围",
+    "tile_forbidden":        "禁",
+    "tile_wall":             "高",
+    "tile_road":             "路",
+    "tile_floor":            "不",
+    "tile_hole":             "穴",
+    "tile_telin":            "进",
+    "tile_telout":           "出",
+    "tile_fence_bound":      "围",
+    "tile_start":            "红",
+    "tile_end":              "蓝",
+    "tile_mpprts_enemy_born": "红",
 }
 
 _FLY_START_TILES = {"tile_flystart"}
@@ -901,6 +907,1152 @@ def generate_operator_profile(operator_name: str, output_path: Optional[str] = N
     # 返回完整路径
     full_path = os.path.abspath(save_path)
     return f"文档已成功生成：{full_path}"
+
+
+# ══════════════════════════════════════════════════════════════════
+# 文档编辑工具
+# ══════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def edit_document(
+    file_path: str,
+    operation: str,
+    old_text: str = "",
+    new_text: str = "",
+    text: str = "",
+    heading: str = "",
+    content: str = "",
+    level: int = 1,
+    position: int = -1,
+    row: int = 0,
+    col: int = 0,
+    table_index: int = 0,
+) -> str:
+    """
+    编辑已有的 DOCX 文档。
+
+    参数:
+        file_path:    DOCX 文件路径
+        operation:    操作类型：
+                      - read:          读取文档结构（段落和表格内容概览）
+                      - replace_text:  查找替换文本
+                      - add_paragraph: 在指定位置插入段落
+                      - add_heading:   在指定位置插入标题
+                      - add_section:   在指定位置插入标题+段落组合
+                      - edit_table:    修改表格单元格内容
+        old_text:     replace_text 用：要查找的文本
+        new_text:     replace_text 用：替换后的文本 / edit_table 用：单元格新值
+        text:         add_paragraph / add_heading 用：文本内容
+        heading:      add_section 用：标题文本
+        content:      add_section 用：段落内容（可用 \\n 分隔多段）
+        level:        add_heading 用：标题级别（1-4，默认 1）
+        position:     插入位置索引（默认 -1 即文档末尾，0 为文档开头）
+        row:          edit_table 用：行索引（从 0 开始）
+        col:          edit_table 用：列索引（从 0 开始）
+        table_index:  edit_table 用：第几个表格（默认第 1 个，从 0 开始）
+    """
+    try:
+        from docx import Document
+        from docx.shared import Pt
+        from docx.oxml.ns import qn
+    except ImportError:
+        return "错误: 缺少 python-docx 库，请运行 'pip install python-docx' 安装"
+
+    abs_path = os.path.abspath(file_path)
+    if not os.path.isfile(abs_path):
+        return f"错误: 文件不存在 {abs_path}"
+
+    try:
+        doc = Document(abs_path)
+    except Exception as e:
+        return f"错误: 无法打开文档 {e}"
+
+    # ── read: 读取文档结构 ──
+    if operation == "read":
+        lines = [f"文档: {abs_path}", ""]
+        for i, para in enumerate(doc.paragraphs):
+            style = para.style.name if para.style else ""
+            prefix = f"[{i}] "
+            if "Heading" in style:
+                level_num = style.replace("Heading ", "")
+                prefix += f"(H{level_num}) "
+            text_content = para.text.strip()
+            if text_content:
+                lines.append(f"{prefix}{text_content[:120]}")
+            else:
+                lines.append(f"{prefix}(空行)")
+        for ti, table in enumerate(doc.tables):
+            lines.append(f"\n── 表格 {ti} ({len(table.rows)}行 x {len(table.columns)}列) ──")
+            for ri, row in enumerate(table.rows):
+                cells = [cell.text.strip()[:30] for cell in row.cells]
+                lines.append(f"  [{ri}] | {' | '.join(cells)} |")
+        return "\n".join(lines)
+
+    # ── replace_text: 查找替换 ──
+    if operation == "replace_text":
+        if not old_text:
+            return "错误: 请提供 old_text 参数"
+        count = 0
+        for para in doc.paragraphs:
+            if old_text in para.text:
+                for run in para.runs:
+                    if old_text in run.text:
+                        run.text = run.text.replace(old_text, new_text)
+                        count += 1
+        for table in doc.tables:
+            for row_obj in table.rows:
+                for cell in row_obj.cells:
+                    for para in cell.paragraphs:
+                        if old_text in para.text:
+                            for run in para.runs:
+                                if old_text in run.text:
+                                    run.text = run.text.replace(old_text, new_text)
+                                    count += 1
+        doc.save(abs_path)
+        return f"替换完成，共替换 {count} 处" if count > 0 else "未找到匹配文本"
+
+    # ── add_paragraph: 插入段落 ──
+    if operation == "add_paragraph":
+        if not text:
+            return "错误: 请提供 text 参数"
+        body = doc.element.body
+        new_para = doc.add_paragraph(text)
+        if position >= 0 and position < len(body):
+            body.insert(position, new_para._element)
+        doc.save(abs_path)
+        return f"已在位置 {position} 插入段落"
+
+    # ── add_heading: 插入标题 ──
+    if operation == "add_heading":
+        if not text:
+            return "错误: 请提供 text 参数"
+        level = max(1, min(4, level))
+        body = doc.element.body
+        new_heading = doc.add_heading(text, level=level)
+        if position >= 0 and position < len(body):
+            body.insert(position, new_heading._element)
+        doc.save(abs_path)
+        return f"已在位置 {position} 插入 H{level} 标题"
+
+    # ── add_section: 插入标题+段落组合 ──
+    if operation == "add_section":
+        if not heading and not content:
+            return "错误: 请提供 heading 或 content 参数"
+        body = doc.element.body
+        insert_pos = position if position >= 0 else len(body)
+        if heading:
+            h = doc.add_heading(heading, level=level)
+            body.insert(insert_pos, h._element)
+            insert_pos += 1
+        if content:
+            for para_text in content.split("\n"):
+                para_text = para_text.strip()
+                if para_text:
+                    p = doc.add_paragraph(para_text)
+                    body.insert(insert_pos, p._element)
+                    insert_pos += 1
+        doc.save(abs_path)
+        return f"已在位置 {position} 插入章节"
+
+    # ── edit_table: 修改表格单元格 ──
+    if operation == "edit_table":
+        tables = doc.tables
+        if table_index < 0 or table_index >= len(tables):
+            return f"错误: 表格索引 {table_index} 超出范围（共 {len(tables)} 个表格）"
+        table = tables[table_index]
+        if row < 0 or row >= len(table.rows):
+            return f"错误: 行索引 {row} 超出范围（共 {len(table.rows)} 行）"
+        if col < 0 or col >= len(table.columns):
+            return f"错误: 列索引 {col} 超出范围（共 {len(table.columns)} 列）"
+        cell = table.rows[row].cells[col]
+        old_val = cell.text.strip()
+        cell.text = new_text
+        doc.save(abs_path)
+        return f"表格{table_index}[{row},{col}]: '{old_val}' -> '{new_text}'"
+
+    return f"错误: 未知操作 '{operation}'，支持: read, replace_text, add_paragraph, add_heading, add_section, edit_table"
+
+
+# ══════════════════════════════════════════════════════════════════
+# Excel 表格工具
+# ══════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def edit_excel(
+    file_path: str,
+    operation: str,
+    sheet: str = "",
+    cell: str = "",
+    value: str = "",
+    data: str = "",
+    formula_str: str = "",
+    bold: bool = False,
+    font_color: str = "",
+    bg_color: str = "",
+    font_size: int = 0,
+    align: str = "",
+    border: bool = False,
+    col_width: str = "",
+    row_height: str = "",
+    params: str = "",
+) -> str:
+    """
+    创建和编辑 Excel (.xlsx) 表格。
+
+    参数:
+        file_path:    Excel 文件路径
+        operation:    操作类型：
+                      - create:            创建新文件（已有则覆盖）
+                      - read:              读取工作表内容
+                      - write:             写入数据（单格或批量）
+                      - formula:           写入公式
+                      - add_sheet:         添加新工作表
+                      - format:            设置单元格格式
+                      - merge:             合并单元格
+                      - col_width:         设置列宽（如 "A:20,B:15"）
+                      - row_height:        设置行高（如 "1:30,2:20"）
+                      - chart:             添加图表
+                      - conditional_format: 条件格式（色阶/数据条）
+                      - data_validation:   数据验证（下拉列表）
+                      - freeze_panes:      冻结窗格
+                      - auto_filter:       自动筛选
+                      - image:             插入图片
+        sheet:        工作表名称（默认活动表）
+        cell:         单元格引用，如 "A1" 或范围 "A1:C3"
+        value:        单格写入的值
+        data:         批量写入数据，JSON 二维数组，如 "[["姓名","分数"],["张三",90]]"
+        formula_str:  公式（不含=号），如 "SUM(A1:A10)"
+        bold:         是否加粗
+        font_color:   字体颜色，如 "FF0000"
+        bg_color:     背景色，如 "FFFF00"
+        font_size:    字号
+        align:        对齐方式：left / center / right
+        border:       是否加边框
+        col_width:    操作类型为 col_width 时：列宽设置，如 "A:20,B:15"
+        row_height:   操作类型为 row_height 时：行高设置，如 "1:30,2:20"
+        params:       高级操作的 JSON 参数，各操作可用字段：
+                      chart:             {"type":"bar","title":"标题","data":"B1:D4","cats":"A2:A4","pos":"F2"}
+                      conditional_format: {"range":"B2:D4","type":"color_scale","colors":["63BE7B","FFEB84","F8696B"]}
+                      data_validation:   {"range":"B2:B100","list":"选项1,选项2,选项3"}
+                      freeze_panes:      {"cell":"B2"}
+                      auto_filter:       {"range":"A1:D10"}
+                      image:             {"path":"logo.png","anchor":"A1","width":200,"height":100}
+    """
+    try:
+        from openpyxl import Workbook, load_workbook
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import range_boundaries
+    except ImportError:
+        return "错误: 缺少 openpyxl 库，请运行 'pip install openpyxl' 安装"
+
+    abs_path = os.path.abspath(file_path)
+
+    # ── helper ──
+    def _get_sheet(wb):
+        if sheet and sheet in wb.sheetnames:
+            return wb[sheet]
+        return wb.active
+
+    def _apply_format(ws, cell_ref):
+        """对单格或范围应用格式"""
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import range_boundaries
+
+        if ":" in cell_ref:
+            min_col, min_row, max_col, max_row = range_boundaries(cell_ref)
+            targets = []
+            for r in range(min_row, max_row + 1):
+                for c in range(min_col, max_col + 1):
+                    targets.append(ws.cell(row=r, column=c))
+        else:
+            targets = [ws[cell_ref]]
+
+        for c in targets:
+            if bold:
+                c.font = Font(bold=True, size=font_size or None, color=font_color or None)
+            elif font_size or font_color:
+                c.font = Font(size=font_size or None, color=font_color or None)
+            if bg_color:
+                c.fill = PatternFill(start_color=bg_color, end_color=bg_color, fill_type="solid")
+            if align:
+                c.alignment = Alignment(horizontal=align)
+            if border:
+                thin = Side(style="thin")
+                c.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    # ── create: 创建新文件 ──
+    if operation == "create":
+        wb = Workbook()
+        ws = wb.active
+        ws.title = sheet or "Sheet1"
+        if data:
+            try:
+                rows = json.loads(data)
+                for r, row_data in enumerate(rows, 1):
+                    for c, val in enumerate(row_data, 1):
+                        ws.cell(row=r, column=c, value=val)
+            except json.JSONDecodeError:
+                return "错误: data 不是有效的 JSON 二维数组"
+        os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
+        wb.save(abs_path)
+        sheets_info = f"工作表: {ws.title}"
+        if data:
+            rows = json.loads(data)
+            sheets_info += f"，{len(rows)} 行数据"
+        return f"已创建 {abs_path}\n{sheets_info}"
+
+    # ── 以下操作需要打开已有文件 ──
+    if not os.path.isfile(abs_path):
+        return f"错误: 文件不存在 {abs_path}"
+
+    # ── read: 读取内容 ──
+    if operation == "read":
+        wb = load_workbook(abs_path, data_only=True)
+        ws = _get_sheet(wb)
+        lines = [f"文件: {abs_path}", f"工作表: {ws.title}", f"尺寸: {ws.max_row} 行 x {ws.max_column} 列", ""]
+
+        if cell and ":" in cell:
+            target = ws[cell]
+            from openpyxl.utils import range_boundaries
+            min_col, min_row, max_col, max_row = range_boundaries(cell)
+            for r in range(min_row, max_row + 1):
+                vals = []
+                for c in range(min_col, max_col + 1):
+                    v = ws.cell(row=r, column=c).value
+                    vals.append(str(v) if v is not None else "")
+                lines.append(f"  [{r}] | {' | '.join(vals)} |")
+        else:
+            for r in range(1, min(ws.max_row + 1, 101)):
+                vals = []
+                for c in range(1, min(ws.max_column + 1, 27)):
+                    v = ws.cell(row=r, column=c).value
+                    vals.append(str(v) if v is not None else "")
+                line = f"  [{r}] | {' | '.join(vals)} |"
+                lines.append(line)
+            if ws.max_row > 100:
+                lines.append(f"  ... 共 {ws.max_row} 行，仅显示前 100 行")
+        return "\n".join(lines)
+
+    # ── write: 写入数据 ──
+    if operation == "write":
+        wb = load_workbook(abs_path)
+        ws = _get_sheet(wb)
+        count = 0
+        if data:
+            try:
+                rows_data = json.loads(data)
+            except json.JSONDecodeError:
+                return "错误: data 不是有效的 JSON 二维数组"
+            if cell:
+                from openpyxl.utils.cell import coordinate_to_tuple
+                start_row, start_col = coordinate_to_tuple(cell)
+            else:
+                start_row, start_col = 1, 1
+            for r, row_data in enumerate(rows_data):
+                for c, val in enumerate(row_data):
+                    ws.cell(row=start_row + r, column=start_col + c, value=val)
+                    count += 1
+        elif cell and value != "":
+            if ":" in cell:
+                from openpyxl.utils import range_boundaries
+                min_col, min_row, max_col, max_row = range_boundaries(cell)
+                for r in range(min_row, max_row + 1):
+                    for c in range(min_col, max_col + 1):
+                        ws.cell(row=r, column=c, value=value)
+                        count += 1
+            else:
+                ws[cell] = value
+                count = 1
+        else:
+            return "错误: 请提供 cell+value 或 data 参数"
+        wb.save(abs_path)
+        return f"已写入 {count} 个单元格"
+
+    # ── formula: 写入公式 ──
+    if operation == "formula":
+        if not cell or not formula_str:
+            return "错误: 请提供 cell 和 formula_str 参数"
+        wb = load_workbook(abs_path)
+        ws = _get_sheet(wb)
+        ws[cell] = f"={formula_str}"
+        wb.save(abs_path)
+        return f"已写入公式: {cell} = {formula_str}"
+
+    # ── add_sheet: 添加工作表 ──
+    if operation == "add_sheet":
+        if not sheet:
+            return "错误: 请提供 sheet 参数（新工作表名称）"
+        wb = load_workbook(abs_path)
+        if sheet in wb.sheetnames:
+            return f"错误: 工作表 '{sheet}' 已存在"
+        wb.create_sheet(title=sheet)
+        wb.save(abs_path)
+        return f"已添加工作表 '{sheet}'，当前工作表: {', '.join(wb.sheetnames)}"
+
+    # ── format: 设置格式 ──
+    if operation == "format":
+        if not cell:
+            return "错误: 请提供 cell 参数"
+        wb = load_workbook(abs_path)
+        ws = _get_sheet(wb)
+        _apply_format(ws, cell)
+        wb.save(abs_path)
+        return f"已设置 {cell} 的格式"
+
+    # ── merge: 合并单元格 ──
+    if operation == "merge":
+        if not cell or ":" not in cell:
+            return "错误: 请提供 cell 参数（范围如 A1:C3）"
+        wb = load_workbook(abs_path)
+        ws = _get_sheet(wb)
+        ws.merge_cells(cell)
+        wb.save(abs_path)
+        return f"已合并 {cell}"
+
+    # ── col_width: 设置列宽 ──
+    if operation == "col_width":
+        if not col_width:
+            return "错误: 请提供 col_width 参数（如 'A:20,B:15'）"
+        wb = load_workbook(abs_path)
+        ws = _get_sheet(wb)
+        for item in col_width.split(","):
+            item = item.strip()
+            if ":" in item:
+                col_letter, width = item.split(":", 1)
+                ws.column_dimensions[col_letter.strip()].width = float(width.strip())
+        wb.save(abs_path)
+        return f"已设置列宽: {col_width}"
+
+    # ── row_height: 设置行高 ──
+    if operation == "row_height":
+        if not row_height:
+            return "错误: 请提供 row_height 参数（如 '1:30,2:20'）"
+        wb = load_workbook(abs_path)
+        ws = _get_sheet(wb)
+        for item in row_height.split(","):
+            item = item.strip()
+            if ":" in item:
+                row_num, height = item.split(":", 1)
+                ws.row_dimensions[int(row_num)].height = float(height.strip())
+        wb.save(abs_path)
+        return f"已设置行高: {row_height}"
+
+    # ── 解析 params JSON ──
+    p = {}
+    if params:
+        try:
+            p = json.loads(params)
+        except json.JSONDecodeError:
+            return "错误: params 不是有效的 JSON"
+
+    # ── chart: 添加图表 ──
+    if operation == "chart":
+        from openpyxl.chart import BarChart, LineChart, PieChart, AreaChart, ScatterChart, Reference
+        chart_map = {
+            "bar": BarChart, "line": LineChart, "pie": PieChart,
+            "area": AreaChart, "scatter": ScatterChart,
+        }
+        ctype = p.get("type", "bar")
+        if ctype not in chart_map:
+            return f"错误: 不支持的图表类型 '{ctype}'，支持: {', '.join(chart_map)}"
+        if not cell:
+            return "错误: 请提供 cell 参数指定数据范围（如 A1:D4）"
+        wb = load_workbook(abs_path)
+        ws = _get_sheet(wb)
+        chart = chart_map[ctype]()
+        chart.title = p.get("title", "")
+        chart.style = int(p.get("style", 10))
+        # 数据系列
+        from openpyxl.utils import range_boundaries as rb
+        d_min_col, d_min_row, d_max_col, d_max_row = rb(cell)
+        cats_ref = p.get("cats", "")
+        if cats_ref:
+            cats = Reference(ws, *rb(cats_ref)[0:2], *rb(cats_ref)[2:4])
+        else:
+            cats = Reference(ws, min_col=d_min_col, min_row=d_min_row + 1, max_row=d_max_row)
+        for c in range(d_min_col + (1 if not cats_ref else 0), d_max_col + 1):
+            vals = Reference(ws, min_col=c, min_row=d_min_row, max_row=d_max_row)
+            chart.add_data(vals, titles_from_data=True)
+        chart.set_categories(cats)
+        # 尺寸
+        chart.width = float(p.get("width", 15))
+        chart.height = float(p.get("height", 10))
+        # 位置
+        pos = p.get("pos", "F2")
+        ws.add_chart(chart, pos)
+        wb.save(abs_path)
+        return f"已添加 {ctype} 图表，数据范围 {cell}，位置 {pos}"
+
+    # ── conditional_format: 条件格式 ──
+    if operation == "conditional_format":
+        from openpyxl.formatting.rule import ColorScaleRule, DataBarRule
+        from openpyxl.utils import range_boundaries as rb
+        if not cell:
+            return "错误: 请提供 cell 参数指定范围（如 B2:D10）"
+        wb = load_workbook(abs_path)
+        ws = _get_sheet(wb)
+        cf_type = p.get("type", "color_scale")
+        colors = p.get("colors", ["63BE7B", "FFEB84", "F8696B"])
+        if cf_type == "color_scale":
+            rule = ColorScaleRule(
+                start_type="min", start_color=colors[0],
+                mid_type="percentile", mid_value=50, mid_color=colors[1] if len(colors) > 1 else "FFFFFF",
+                end_type="max", end_color=colors[2] if len(colors) > 2 else "F8696B",
+            )
+            ws.conditional_formatting.add(cell, rule)
+        elif cf_type == "data_bar":
+            from openpyxl.formatting.rule import DataBarRule
+            rule = DataBarRule(start_type="min", end_type="max", color=colors[0])
+            ws.conditional_formatting.add(cell, rule)
+        else:
+            return f"错误: 不支持的条件格式类型 '{cf_type}'，支持: color_scale, data_bar"
+        wb.save(abs_path)
+        return f"已对 {cell} 添加 {cf_type} 条件格式"
+
+    # ── data_validation: 数据验证 ──
+    if operation == "data_validation":
+        from openpyxl.worksheet.datavalidation import DataValidation
+        if not cell:
+            return "错误: 请提供 cell 参数指定范围（如 B2:B100）"
+        list_str = p.get("list", "")
+        if not list_str:
+            return "错误: params 中请提供 list 字段（逗号分隔的选项）"
+        wb = load_workbook(abs_path)
+        ws = _get_sheet(wb)
+        dv = DataValidation(type="list", formula1=f'"{list_str}"', allow_blank=True)
+        dv.error = "请从列表中选择"
+        dv.errorTitle = "无效输入"
+        ws.add_data_validation(dv)
+        dv.add(cell)
+        wb.save(abs_path)
+        return f"已对 {cell} 添加下拉列表: {list_str}"
+
+    # ── freeze_panes: 冻结窗格 ──
+    if operation == "freeze_panes":
+        freeze_cell = p.get("cell", cell or "A2")
+        wb = load_workbook(abs_path)
+        ws = _get_sheet(wb)
+        ws.freeze_panes = freeze_cell
+        wb.save(abs_path)
+        return f"已冻结窗格: {freeze_cell}"
+
+    # ── auto_filter: 自动筛选 ──
+    if operation == "auto_filter":
+        filter_range = cell or p.get("range", "")
+        if not filter_range:
+            return "错误: 请提供 cell 参数指定筛选范围（如 A1:D10）"
+        wb = load_workbook(abs_path)
+        ws = _get_sheet(wb)
+        ws.auto_filter.ref = filter_range
+        wb.save(abs_path)
+        return f"已对 {filter_range} 启用自动筛选"
+
+    # ── image: 插入图片 ──
+    if operation == "image":
+        from openpyxl.drawing.image import Image as XlImage
+        img_path = p.get("path", "")
+        if not img_path:
+            return "错误: params 中请提供 path 字段（图片路径）"
+        img_abs = os.path.abspath(img_path)
+        if not os.path.isfile(img_abs):
+            return f"错误: 图片不存在 {img_abs}"
+        wb = load_workbook(abs_path)
+        ws = _get_sheet(wb)
+        img = XlImage(img_abs)
+        if "width" in p:
+            img.width = int(p["width"])
+        if "height" in p:
+            img.height = int(p["height"])
+        anchor = p.get("anchor", cell or "A1")
+        ws.add_image(img, anchor)
+        wb.save(abs_path)
+        return f"已插入图片 {img_path}，锚点 {anchor}"
+
+    return (
+        f"错误: 未知操作 '{operation}'，支持: "
+        "create, read, write, formula, add_sheet, format, merge, col_width, row_height, "
+        "chart, conditional_format, data_validation, freeze_panes, auto_filter, image"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════
+# PDF 读写工具
+# ══════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def edit_pdf(
+    file_path: str,
+    operation: str,
+    output_path: str = "",
+    pages: str = "",
+    content: str = "",
+    title: str = "",
+    author: str = "",
+    font_size: int = 12,
+    page_size: str = "A4",
+    margin: int = 72,
+    params: str = "",
+) -> str:
+    """
+    读取和生成 PDF 文件。
+
+    参数:
+        file_path:    PDF 文件路径（read/info/merge/extract 用）
+        operation:    操作类型：
+                      - read:    读取 PDF 文本内容
+                      - info:    获取 PDF 元信息（页数、标题、作者等）
+                      - create:  创建新 PDF（从文本生成）
+                      - merge:   合并多个 PDF
+                      - extract: 提取指定页面到新文件
+                      - to_word: PDF 转 Word (.docx)
+        output_path:  输出文件路径（create/merge/extract 必填）
+        pages:        页码范围，如 "1,3,5-8"（read/extract 用，默认全部）
+        content:      文本内容（create 用，用 \\n 分段）
+        title:        文档标题（create 用）
+        author:       文档作者（create 用）
+        font_size:    字号（create 用，默认 12）
+        page_size:    页面大小（create 用：A4/Letter/A5，默认 A4）
+        margin:       页边距点数（create 用，默认 72，即 1 英寸）
+        params:       JSON 参数，高级选项：
+                      merge:   {"files":["a.pdf","b.pdf","c.pdf"]}
+                      create:  {"line_spacing":1.5,"header":"页眉","footer":"页脚"}
+    """
+    abs_path = os.path.abspath(file_path)
+
+    # ── helper: 解析页码范围 ──
+    def _parse_pages(pages_str: str, max_page: int) -> list:
+        if not pages_str:
+            return list(range(max_page))
+        result = []
+        for part in pages_str.split(","):
+            part = part.strip()
+            if "-" in part:
+                start, end = part.split("-", 1)
+                result.extend(range(int(start) - 1, int(end)))
+            else:
+                result.append(int(part) - 1)
+        return [p for p in result if 0 <= p < max_page]
+
+    # ── read: 读取文本 ──
+    if operation == "read":
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            return "错误: 缺少 pypdf 库，请运行 'pip install pypdf' 安装"
+        if not os.path.isfile(abs_path):
+            return f"错误: 文件不存在 {abs_path}"
+        reader = PdfReader(abs_path)
+        page_list = _parse_pages(pages, len(reader.pages))
+        lines = [f"文件: {abs_path}", f"总页数: {len(reader.pages)}", ""]
+        for i in page_list:
+            text = reader.pages[i].extract_text() or ""
+            lines.append(f"── 第 {i + 1} 页 ──")
+            lines.append(text.strip() if text.strip() else "(无可提取文本)")
+            lines.append("")
+        return "\n".join(lines)
+
+    # ── info: 获取元信息 ──
+    if operation == "info":
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            return "错误: 缺少 pypdf 库，请运行 'pip install pypdf' 安装"
+        if not os.path.isfile(abs_path):
+            return f"错误: 文件不存在 {abs_path}"
+        reader = PdfReader(abs_path)
+        meta = reader.metadata
+        lines = [
+            f"文件: {abs_path}",
+            f"页数: {len(reader.pages)}",
+            f"标题: {meta.title if meta and meta.title else '无'}",
+            f"作者: {meta.author if meta and meta.author else '无'}",
+            f"主题: {meta.subject if meta and meta.subject else '无'}",
+            f"创建者: {meta.creator if meta and meta.creator else '无'}",
+        ]
+        if reader.pages:
+            page = reader.pages[0]
+            box = page.mediabox
+            lines.append(f"页面尺寸: {float(box.width):.0f} x {float(box.height):.0f} 点")
+        lines.append(f"加密: {'是' if reader.is_encrypted else '否'}")
+        return "\n".join(lines)
+
+    # ── create: 创建 PDF ──
+    if operation == "create":
+        try:
+            from reportlab.lib.pagesizes import A4, LETTER, A5
+            from reportlab.lib.units import mm
+            from reportlab.pdfgen import canvas
+            from reportlab.lib.styles import getSampleStyleSheet
+            from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+            from reportlab.lib.styles import ParagraphStyle
+            from reportlab.pdfbase import pdfmetrics
+            from reportlab.pdfbase.ttfonts import TTFont
+        except ImportError:
+            return "错误: 缺少 reportlab 库，请运行 'pip install reportlab' 安装"
+        if not content:
+            return "错误: 请提供 content 参数"
+        if not output_path:
+            return "错误: 请提供 output_path 参数"
+
+        size_map = {"A4": A4, "Letter": LETTER, "A5": A5}
+        pagesize = size_map.get(page_size, A4)
+
+        # 解析 params
+        p = {}
+        if params:
+            try:
+                p = json.loads(params)
+            except json.JSONDecodeError:
+                return "错误: params 不是有效的 JSON"
+
+        out_abs = os.path.abspath(output_path)
+        os.makedirs(os.path.dirname(out_abs) or ".", exist_ok=True)
+
+        # 注册中文字体（尝试常见路径）
+        chinese_font = None
+        font_paths = [
+            "C:/Windows/Fonts/msyh.ttc",      # 微软雅黑
+            "C:/Windows/Fonts/simsun.ttc",      # 宋体
+            "C:/Windows/Fonts/simhei.ttf",      # 黑体
+            "/System/Library/Fonts/PingFang.ttc",  # macOS
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",  # Linux
+        ]
+        for fp in font_paths:
+            if os.path.isfile(fp):
+                try:
+                    pdfmetrics.registerFont(TTFont("ChineseFont", fp))
+                    chinese_font = "ChineseFont"
+                    break
+                except Exception:
+                    continue
+
+        font_name = chinese_font or "Helvetica"
+
+        doc = SimpleDocTemplate(
+            out_abs, pagesize=pagesize,
+            leftMargin=margin, rightMargin=margin,
+            topMargin=margin, bottomMargin=margin,
+            title=title or "",
+            author=author or "",
+        )
+
+        style = ParagraphStyle(
+            "Body",
+            fontName=font_name,
+            fontSize=font_size,
+            leading=font_size * float(p.get("line_spacing", 1.5)),
+        )
+        title_style = ParagraphStyle(
+            "Title",
+            fontName=font_name,
+            fontSize=font_size + 6,
+            leading=(font_size + 6) * 1.5,
+            alignment=1,  # center
+            spaceAfter=20,
+        )
+
+        story = []
+        if title:
+            story.append(Paragraph(title, title_style))
+        for para in content.split("\n"):
+            para = para.strip()
+            if para:
+                story.append(Paragraph(para, style))
+                story.append(Spacer(1, font_size * 0.5))
+
+        doc.build(story)
+        return f"已创建 PDF: {out_abs}（{len(content.split(chr(10)))} 段）"
+
+    # ── merge: 合并 PDF ──
+    if operation == "merge":
+        try:
+            from pypdf import PdfReader, PdfWriter
+        except ImportError:
+            return "错误: 缺少 pypdf 库，请运行 'pip install pypdf' 安装"
+        if not output_path:
+            return "错误: 请提供 output_path 参数"
+
+        p = {}
+        if params:
+            try:
+                p = json.loads(params)
+            except json.JSONDecodeError:
+                return "错误: params 不是有效的 JSON"
+
+        files = p.get("files", [])
+        if not files and file_path:
+            files = [file_path]
+        if not files:
+            return "错误: 请在 params.files 中提供要合并的 PDF 文件列表"
+
+        writer = PdfWriter()
+        total_pages = 0
+        for f in files:
+            f_abs = os.path.abspath(f)
+            if not os.path.isfile(f_abs):
+                return f"错误: 文件不存在 {f_abs}"
+            reader = PdfReader(f_abs)
+            for page in reader.pages:
+                writer.add_page(page)
+                total_pages += 1
+
+        out_abs = os.path.abspath(output_path)
+        os.makedirs(os.path.dirname(out_abs) or ".", exist_ok=True)
+        with open(out_abs, "wb") as f:
+            writer.write(f)
+        return f"已合并 {len(files)} 个 PDF（共 {total_pages} 页）-> {out_abs}"
+
+    # ── extract: 提取页面 ──
+    if operation == "extract":
+        try:
+            from pypdf import PdfReader, PdfWriter
+        except ImportError:
+            return "错误: 缺少 pypdf 库，请运行 'pip install pypdf' 安装"
+        if not os.path.isfile(abs_path):
+            return f"错误: 文件不存在 {abs_path}"
+        if not output_path:
+            return "错误: 请提供 output_path 参数"
+        reader = PdfReader(abs_path)
+        page_list = _parse_pages(pages, len(reader.pages))
+        if not page_list:
+            return "错误: 未指定有效页码"
+        writer = PdfWriter()
+        for i in page_list:
+            writer.add_page(reader.pages[i])
+        out_abs = os.path.abspath(output_path)
+        os.makedirs(os.path.dirname(out_abs) or ".", exist_ok=True)
+        with open(out_abs, "wb") as f:
+            writer.write(f)
+        return f"已提取 {len(page_list)} 页 -> {out_abs}"
+
+    # ── to_word: PDF 转 Word ──
+    if operation == "to_word":
+        try:
+            from pdf2docx import Converter
+        except ImportError:
+            return "错误: 缺少 pdf2docx 库，请运行 'pip install pdf2docx' 安装"
+        if not os.path.isfile(abs_path):
+            return f"错误: 文件不存在 {abs_path}"
+        out_abs = os.path.abspath(output_path) if output_path else abs_path.rsplit(".", 1)[0] + ".docx"
+        os.makedirs(os.path.dirname(out_abs) or ".", exist_ok=True)
+        # 解析页码范围
+        p = {}
+        if params:
+            try:
+                p = json.loads(params)
+            except json.JSONDecodeError:
+                return "错误: params 不是有效的 JSON"
+        cv = Converter(abs_path)
+        start_page = p.get("start", 0)
+        end_page = p.get("end", None)
+        if pages:
+            page_list = _parse_pages(pages, len(cv.pages))
+            if page_list:
+                start_page = page_list[0]
+                end_page = page_list[-1] + 1
+        cv.convert(out_abs, start=start_page, end=end_page)
+        cv.close()
+        return f"已转换: {abs_path} -> {out_abs}"
+
+    return (
+        f"错误: 未知操作 '{operation}'，支持: read, info, create, merge, extract, to_word"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════
+# 己方干员查询工具
+# ══════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def query_operator(name: str, max_results: int = 5) -> str:
+    """
+    查询明日方舟己方干员的详细数据，包括属性、天赋、技能。
+
+    参数:
+        name:         干员名称或 ID（支持模糊搜索，如 "凯尔希"、"amiya"、"Mon3tr"）
+        max_results:  最大返回条数（默认 5）
+    """
+    _LOCAL_BASE = Path(__file__).parent / "ArknightsGameData"
+    _REMOTE_BASE = "https://raw.githubusercontent.com/Kengxxiao/ArknightsGameData/master/zh_CN"
+
+    def _data_path(rel: str) -> str:
+        local = _LOCAL_BASE / rel
+        if local.is_file():
+            return str(local)
+        return f"{_REMOTE_BASE}/{rel}"
+
+    try:
+        _chars = _load_json(_data_path("gamedata/excel/character_table.json"))
+        _skills = _load_json(_data_path("gamedata/excel/skill_table.json"))
+    except Exception as e:
+        return f"错误: 无法加载游戏数据 {e}"
+
+    _PROF = {"PIONEER": "先锋", "WARRIOR": "近卫", "TANK": "重装", "SNIPER": "狙击",
+             "CASTER": "术师", "MEDIC": "医疗", "SUPPORTER": "辅助", "SPECIALIST": "特种"}
+    _POS = {"MELEE": "近战", "RANGED": "远程"}
+    _RARITY = {"TIER_1": "★", "TIER_2": "★★", "TIER_3": "★★★",
+               "TIER_4": "★★★★", "TIER_5": "★★★★★", "TIER_6": "★★★★★★"}
+
+    def _clean(s):
+        return re.sub(r"<[^>]+>", "", str(s)) if s else ""
+
+    query = name.lower().strip()
+    matches = [
+        (cid, d) for cid, d in _chars.items()
+        if query in d.get("name", "").lower()
+        or query in cid.lower()
+        or query in d.get("appellation", "").lower()
+    ]
+    if not matches:
+        return f"未找到干员 \"{name}\""
+
+    results = []
+    for cid, d in matches[:max_results]:
+        lines = [f"[{cid}]"]
+        lines.append(f"  名称: {d.get('name')} ({d.get('appellation', '')})")
+        lines.append(f"  稀有度: {_RARITY.get(d.get('rarity'), d.get('rarity'))}")
+        lines.append(f"  职业: {_PROF.get(d.get('profession'), d.get('profession'))}")
+        lines.append(f"  分支: {d.get('subProfessionId')}")
+        lines.append(f"  位置: {_POS.get(d.get('position'), d.get('position'))}")
+        desc = _clean(d.get("description"))
+        if desc:
+            lines.append(f"  描述: {desc[:120]}")
+        nation = d.get("nationId", "")
+        if nation:
+            lines.append(f"  势力: {nation}")
+
+        # 满级属性
+        phases = d.get("phases", [])
+        if phases:
+            attrs_list = phases[-1].get("attributesKeyFrames", [])
+            if attrs_list:
+                a = attrs_list[-1].get("data", {})
+                lines.append("  满级属性:")
+                for k, label in [("maxHp", "生命"), ("atk", "攻击"), ("def", "防御"),
+                                 ("magicResistance", "法抗"), ("cost", "费用"),
+                                 ("blockCnt", "阻挡"), ("baseAttackTime", "攻击间隔")]:
+                    v = a.get(k)
+                    if v is not None:
+                        lines.append(f"    {label}: {v}")
+
+        # 天赋
+        talents = d.get("talents", [])
+        if talents:
+            lines.append("  天赋:")
+            for t in talents:
+                cands = t.get("candidates", [])
+                if cands:
+                    last_t = cands[-1]
+                    t_name = last_t.get("name", "?")
+                    t_desc = _clean(last_t.get("description", ""))[:100]
+                    lines.append(f"    - {t_name}: {t_desc}")
+
+        # 技能
+        char_skills = d.get("skills", [])
+        if char_skills:
+            lines.append("  技能:")
+            for sk in char_skills:
+                sk_id = sk.get("skillId", "")
+                sk_data = _skills.get(sk_id, {})
+                levels = sk_data.get("levels", [])
+                sk_name = levels[-1].get("name", sk_id) if levels else sk_id
+                sk_desc = _clean(levels[-1].get("description", ""))[:100] if levels else ""
+                lines.append(f"    - {sk_name}: {sk_desc}")
+
+        results.append("\n".join(lines))
+    return "\n\n".join(results)
+
+
+# ══════════════════════════════════════════════════════════════════
+# 剧情查询工具
+# ══════════════════════════════════════════════════════════════════
+
+def _parse_story_script(text: str, show_stage_direction: bool = False) -> str:
+    """解析剧情脚本，提取对话和旁白"""
+    lines = text.split("\n")
+    result = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        # 对话: [name="角色"] 内容
+        m = re.match(r'\[name="([^"]+)"\]\s*(.*)', line)
+        if m:
+            char, dialogue = m.group(1), m.group(2).strip()
+            if dialogue:
+                result.append(f"{char}: {dialogue}")
+            continue
+        # 旁白/描述行（不以 [ 开头的纯文本）
+        if not line.startswith("["):
+            result.append(line)
+            continue
+        # 可选：显示舞台指令
+        if show_stage_direction:
+            tag = re.match(r"\[(\w+)", line)
+            if tag:
+                result.append(f"[{tag.group(1)}]")
+    return "\n".join(result)
+
+
+@mcp.tool()
+def query_story(
+    query: str = "",
+    story_id: str = "",
+    operation: str = "search",
+    max_results: int = 20,
+    show_direction: bool = False,
+) -> str:
+    """
+    查询和获取明日方舟剧情文本。
+
+    参数:
+        query:           搜索关键词（章节名、活动名、关卡代号，如 "第七章"、"骑兵与猎人"、"GT-1"）
+        story_id:        剧情 ID（read 操作用，如 "obt/main/level_main_01-07_beg"）
+        operation:       操作类型：
+                         - search: 搜索剧情（默认）
+                         - read:   读取指定剧情文本
+                         - list:   列出某章节/活动的所有剧情
+        max_results:     search 最大返回条数（默认 20）
+        show_direction:  是否显示舞台指令（默认 false，仅显示对话）
+    """
+    _LOCAL_STORY = Path(__file__).parent / "ArknightsGameData"
+    _REMOTE_BASE = "https://raw.githubusercontent.com/Kengxxiao/ArknightsGameData/master/zh_CN"
+
+    def _data_path(rel: str) -> str:
+        local = _LOCAL_STORY / rel
+        if local.is_file():
+            return str(local)
+        return f"{_REMOTE_BASE}/{rel}"
+
+    # ── 加载剧情索引 ──
+    try:
+        review = _load_json(_data_path("gamedata/excel/story_review_table.json"))
+        story_table = _load_json(_data_path("gamedata/excel/story_table.json"))
+    except Exception as e:
+        return f"错误: 无法加载剧情索引 {e}"
+
+    # story_review_table 的 storyId 格式: main_15_level_main_15-15_beg
+    # story_table 的 key 格式:        obt/main/level_main_15-15_beg
+    # 实际文件路径:                    gamedata/story/obt/main/level_main_15-15_beg.txt
+    def _resolve_story_id(sid: str) -> str:
+        """将 review_table 的 storyId 转为实际文件路径"""
+        # 先直接查 story_table
+        if sid in story_table:
+            return sid
+        # 尝试转换: main_15_level_main_15-15_beg -> obt/main/level_main_15-15_beg
+        # 匹配模式: main_{chapter}_level_{rest}
+        m = re.match(r"main_(\d+)_level_(.+)", sid)
+        if m:
+            candidate = f"obt/main/level_{m.group(2)}"
+            if candidate in story_table:
+                return candidate
+        # 活动剧情: act3d0_level_act3d0_01_beg -> obt/activity/level_act3d0_01_beg
+        m = re.match(r"act\w+_level_(.+)", sid)
+        if m:
+            candidate = f"obt/activity/level_{m.group(1)}"
+            if candidate in story_table:
+                return candidate
+        return sid
+
+    # ── search: 搜索剧情 ──
+    if operation == "search":
+        if not query:
+            return "错误: 请提供 query 参数"
+        q = query.lower().strip()
+        matches = []
+        for key, entry in review.items():
+            name = entry.get("name", "")
+            entry_type = entry.get("entryType", "")
+            # 匹配活动名
+            if q in name.lower() or q in key.lower():
+                for iu in entry.get("infoUnlockDatas", []):
+                    matches.append({
+                        "activity": name,
+                        "storyId": iu.get("storyId", ""),
+                        "storyCode": iu.get("storyCode", ""),
+                        "storyName": iu.get("storyName", ""),
+                        "avgTag": iu.get("avgTag", ""),
+                        "entryType": entry_type,
+                    })
+            else:
+                # 匹配关卡代号或剧情名
+                for iu in entry.get("infoUnlockDatas", []):
+                    code = iu.get("storyCode") or ""
+                    sname = iu.get("storyName") or ""
+                    sid = iu.get("storyId") or ""
+                    if q in code.lower() or q in sname.lower() or q in sid.lower():
+                        matches.append({
+                            "activity": name,
+                            "storyId": sid,
+                            "storyCode": code,
+                            "storyName": sname,
+                            "avgTag": iu.get("avgTag", ""),
+                            "entryType": entry_type,
+                        })
+        if not matches:
+            return f"未找到匹配 \"{query}\" 的剧情"
+        lines = [f"找到 {len(matches)} 条匹配（显示前 {min(max_results, len(matches))} 条）:", ""]
+        for m in matches[:max_results]:
+            tag = f"[{m['avgTag']}]" if m["avgTag"] else ""
+            code = m["storyCode"] or "—"
+            resolved = _resolve_story_id(m["storyId"])
+            lines.append(f"  {m['activity']} / {code} {m['storyName']} {tag}")
+            lines.append(f"    storyId: {m['storyId']}")
+            lines.append("")
+        if len(matches) > max_results:
+            lines.append(f"... 共 {len(matches)} 条，仅显示前 {max_results} 条")
+        return "\n".join(lines)
+
+    # ── list: 列出章节/活动剧情 ──
+    if operation == "list":
+        if not query:
+            return "错误: 请提供 query 参数（章节名或活动名）"
+        q = query.lower().strip()
+        found = None
+        for key, entry in review.items():
+            name = entry.get("name", "")
+            if q in name.lower() or q in key.lower():
+                found = (key, entry)
+                break
+        if not found:
+            return f"未找到匹配 \"{query}\" 的章节/活动"
+        key, entry = found
+        lines = [
+            f"活动: {entry.get('name', key)}",
+            f"类型: {entry.get('entryType', '?')} / {entry.get('actType', '?')}",
+            f"剧情数: {len(entry.get('infoUnlockDatas', []))}",
+            "",
+        ]
+        for iu in entry.get("infoUnlockDatas", []):
+            tag = f"[{iu.get('avgTag', '')}]" if iu.get("avgTag") else ""
+            code = iu.get("storyCode", "—")
+            lines.append(f"  {code} {iu.get('storyName', '?')} {tag}")
+            lines.append(f"    storyId: {iu.get('storyId', '')}")
+        return "\n".join(lines)
+
+    # ── read: 读取剧情文本 ──
+    if operation == "read":
+        if not story_id:
+            return "错误: 请提供 story_id 参数"
+        resolved = _resolve_story_id(story_id)
+        url = _data_path(f"gamedata/story/{resolved}.txt")
+        try:
+            if url.startswith(("http://", "https://")):
+                r = requests.get(url, timeout=15)
+                if r.status_code != 200:
+                    return f"错误: 无法获取剧情文件 (HTTP {r.status_code})"
+                text = r.text
+            else:
+                with open(url, "r", encoding="utf-8") as f:
+                    text = f.read()
+        except Exception as e:
+            return f"错误: 无法读取剧情 {e}"
+        parsed = _parse_story_script(text, show_direction)
+        if not parsed:
+            return "该剧情文件无可提取的对话内容"
+        return f"[{story_id}]\n\n{parsed}"
+
+    return f"错误: 未知操作 '{operation}'，支持: search, read, list"
 
 
 # ══════════════════════════════════════════════════════════════════

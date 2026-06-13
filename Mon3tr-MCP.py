@@ -8,8 +8,11 @@ Mon3tr-MCP — 明日方舟 MCP 工具集
   地图解析:  parse_map · get_cell_info · get_map_legend
   敌人数据:  get_level_enemies · get_enemy_by_id
   文档工具:  generate_operator_profile · edit_document · edit_excel · edit_pdf
+  文件工具:  edit_txt · edit_json
   干员查询:  query_operator
   剧情工具:  query_story
+  CSGO赛事:  csgo_matches · csgo_rankings · csgo_tournaments · csgo_player_stats
+             数据源: HLTV(抓取) + Liquipedia(API) + 5EPlay(抓取)
   注: parse_map / get_level_enemies / get_enemy_by_id 均支持本地路径、完整 URL
       或仓库相对路径（自动补全远端地址）
 """
@@ -927,29 +930,38 @@ def edit_document(
     row: int = 0,
     col: int = 0,
     table_index: int = 0,
+    font_name: str = "",
+    font_size: int = 0,
 ) -> str:
     """
-    编辑已有的 DOCX 文档。
+    创建或编辑 DOCX 文档。文件不存在时自动创建新文档。
 
     参数:
         file_path:    DOCX 文件路径
         operation:    操作类型：
+                      - create:        创建新文档（如已存在则覆盖），可通过 content 传入初始内容
                       - read:          读取文档结构（段落和表格内容概览）
                       - replace_text:  查找替换文本
                       - add_paragraph: 在指定位置插入段落
                       - add_heading:   在指定位置插入标题
                       - add_section:   在指定位置插入标题+段落组合
+                      - add_table:     插入表格（content 为 JSON 二维数组）
                       - edit_table:    修改表格单元格内容
+                      - set_font:      设置文档默认字体
         old_text:     replace_text 用：要查找的文本
         new_text:     replace_text 用：替换后的文本 / edit_table 用：单元格新值
         text:         add_paragraph / add_heading 用：文本内容
         heading:      add_section 用：标题文本
         content:      add_section 用：段落内容（可用 \\n 分隔多段）
+                      create 用：初始正文内容（可用 \\n 分段）
+                      add_table 用：JSON 二维数组，如 '[["姓名","年龄"],["Mon3tr","?"]]'
         level:        add_heading 用：标题级别（1-4，默认 1）
         position:     插入位置索引（默认 -1 即文档末尾，0 为文档开头）
         row:          edit_table 用：行索引（从 0 开始）
         col:          edit_table 用：列索引（从 0 开始）
         table_index:  edit_table 用：第几个表格（默认第 1 个，从 0 开始）
+        font_name:    字体名称（如 "宋体"、"Times New Roman"），create/set_font 时使用，默认微软雅黑
+        font_size:    字号（整数，单位磅），create/set_font 时使用，默认 10.5
     """
     try:
         from docx import Document
@@ -959,13 +971,53 @@ def edit_document(
         return "错误: 缺少 python-docx 库，请运行 'pip install python-docx' 安装"
 
     abs_path = os.path.abspath(file_path)
-    if not os.path.isfile(abs_path):
-        return f"错误: 文件不存在 {abs_path}"
+    os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
 
-    try:
-        doc = Document(abs_path)
-    except Exception as e:
-        return f"错误: 无法打开文档 {e}"
+    _font = font_name or "微软雅黑"
+    _size = Pt(font_size) if font_size > 0 else Pt(10.5)
+
+    def _apply_font(doc):
+        style = doc.styles['Normal']
+        style.font.name = _font
+        style.element.rPr.rFonts.set(qn('w:eastAsia'), _font)
+        style.font.size = _size
+
+    # ── create: 创建新文档 ──
+    if operation == "create":
+        doc = Document()
+        _apply_font(doc)
+        if text:
+            doc.add_heading(text, level=0)
+        if content:
+            for para_text in content.split("\n"):
+                para_text = para_text.strip()
+                if para_text:
+                    doc.add_paragraph(para_text)
+        doc.save(abs_path)
+        return f"文档已创建：{abs_path}"
+
+    # 非 create 操作：打开已有文档或创建空文档
+    if os.path.isfile(abs_path):
+        try:
+            doc = Document(abs_path)
+        except Exception as e:
+            return f"错误: 无法打开文档 {e}"
+    else:
+        doc = Document()
+        _apply_font(doc)
+
+    # ── set_font: 修改文档默认字体 ──
+    if operation == "set_font":
+        _apply_font(doc)
+        # 同时更新已有段落的字体
+        for para in doc.paragraphs:
+            for run in para.runs:
+                run.font.name = _font
+                run.element.rPr.rFonts.set(qn('w:eastAsia'), _font)
+                if font_size > 0:
+                    run.font.size = _size
+        doc.save(abs_path)
+        return f"已设置字体为 {_font}，字号 {font_size or 10.5}pt"
 
     # ── read: 读取文档结构 ──
     if operation == "read":
@@ -1054,6 +1106,26 @@ def edit_document(
         doc.save(abs_path)
         return f"已在位置 {position} 插入章节"
 
+    # ── add_table: 插入表格 ──
+    if operation == "add_table":
+        if not content:
+            return "错误: 请提供 content 参数（JSON 二维数组）"
+        try:
+            table_data = json.loads(content)
+        except json.JSONDecodeError as e:
+            return f"错误: content 不是有效 JSON: {e}"
+        if not table_data or not isinstance(table_data, list):
+            return "错误: content 应为二维数组"
+        rows_count = len(table_data)
+        cols_count = max(len(r) for r in table_data)
+        table = doc.add_table(rows=rows_count, cols=cols_count)
+        table.style = 'Table Grid'
+        for ri, row_data in enumerate(table_data):
+            for ci, val in enumerate(row_data):
+                table.rows[ri].cells[ci].text = str(val)
+        doc.save(abs_path)
+        return f"已插入 {rows_count}x{cols_count} 表格"
+
     # ── edit_table: 修改表格单元格 ──
     if operation == "edit_table":
         tables = doc.tables
@@ -1070,7 +1142,7 @@ def edit_document(
         doc.save(abs_path)
         return f"表格{table_index}[{row},{col}]: '{old_val}' -> '{new_text}'"
 
-    return f"错误: 未知操作 '{operation}'，支持: read, replace_text, add_paragraph, add_heading, add_section, edit_table"
+    return f"错误: 未知操作 '{operation}'，支持: create, read, replace_text, add_paragraph, add_heading, add_section, add_table, edit_table, set_font"
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1760,6 +1832,292 @@ def edit_pdf(
 
 
 # ══════════════════════════════════════════════════════════════════
+# TXT 文本文件工具
+# ══════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def edit_txt(
+    file_path: str,
+    operation: str,
+    content: str = "",
+    encoding: str = "utf-8",
+    old_text: str = "",
+    new_text: str = "",
+    line: int = 0,
+    count: int = 0,
+) -> str:
+    """
+    创建和编辑纯文本 (.txt) 文件。
+
+    参数:
+        file_path:  TXT 文件路径
+        operation:  操作类型：
+                    - create:   创建新文件（已有则覆盖）
+                    - read:     读取文件内容
+                    - write:    写入内容（覆盖）
+                    - append:   追加内容到末尾
+                    - replace:  查找替换文本
+                    - insert:   在指定行插入内容
+                    - delete:   删除指定行
+        content:    写入/追加/插入的内容
+        encoding:   文件编码（默认 utf-8）
+        old_text:   replace 用：要查找的文本
+        new_text:   replace 用：替换后的文本
+        line:       insert/delete 用：行号（从 1 开始）
+        count:      delete 用：要删除的行数（默认 1）
+    """
+    abs_path = os.path.abspath(file_path)
+
+    # ── create: 创建新文件 ──
+    if operation == "create":
+        os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
+        with open(abs_path, "w", encoding=encoding) as f:
+            f.write(content)
+        return f"已创建 {abs_path}（{len(content)} 字符）"
+
+    # ── read: 读取内容 ──
+    if operation == "read":
+        if not os.path.isfile(abs_path):
+            return f"错误: 文件不存在 {abs_path}"
+        with open(abs_path, "r", encoding=encoding) as f:
+            text = f.read()
+        lines_count = text.count("\n") + 1
+        return f"文件: {abs_path}\n行数: {lines_count}\n字符数: {len(text)}\n\n{text}"
+
+    # ── 以下操作需要文件存在 ──
+    if not os.path.isfile(abs_path):
+        return f"错误: 文件不存在 {abs_path}"
+
+    # ── write: 写入内容（覆盖）──
+    if operation == "write":
+        with open(abs_path, "w", encoding=encoding) as f:
+            f.write(content)
+        return f"已写入 {abs_path}（{len(content)} 字符）"
+
+    # ── append: 追加内容 ──
+    if operation == "append":
+        with open(abs_path, "a", encoding=encoding) as f:
+            f.write(content)
+        return f"已追加 {len(content)} 字符到 {abs_path}"
+
+    # ── replace: 查找替换 ──
+    if operation == "replace":
+        if not old_text:
+            return "错误: 请提供 old_text 参数"
+        with open(abs_path, "r", encoding=encoding) as f:
+            text = f.read()
+        count = text.count(old_text)
+        if count == 0:
+            return "未找到匹配文本"
+        text = text.replace(old_text, new_text)
+        with open(abs_path, "w", encoding=encoding) as f:
+            f.write(text)
+        return f"替换完成，共替换 {count} 处"
+
+    # ── insert: 在指定行插入 ──
+    if operation == "insert":
+        if line < 1:
+            return "错误: 行号必须 >= 1"
+        with open(abs_path, "r", encoding=encoding) as f:
+            lines = f.readlines()
+        insert_idx = min(line - 1, len(lines))
+        new_lines = content.split("\n")
+        for i, ln in enumerate(new_lines):
+            lines.insert(insert_idx + i, ln + "\n")
+        with open(abs_path, "w", encoding=encoding) as f:
+            f.writelines(lines)
+        return f"已在第 {line} 行插入 {len(new_lines)} 行"
+
+    # ── delete: 删除指定行 ──
+    if operation == "delete":
+        if line < 1:
+            return "错误: 行号必须 >= 1"
+        with open(abs_path, "r", encoding=encoding) as f:
+            lines = f.readlines()
+        if line > len(lines):
+            return f"错误: 行号 {line} 超出范围（共 {len(lines)} 行）"
+        del_count = min(count or 1, len(lines) - line + 1)
+        del lines[line - 1:line - 1 + del_count]
+        with open(abs_path, "w", encoding=encoding) as f:
+            f.writelines(lines)
+        return f"已删除第 {line} 行起 {del_count} 行"
+
+    return f"错误: 未知操作 '{operation}'，支持: create, read, write, append, replace, insert, delete"
+
+
+# ══════════════════════════════════════════════════════════════════
+# JSON 文件工具
+# ══════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def edit_json(
+    file_path: str,
+    operation: str,
+    data: str = "",
+    key: str = "",
+    value: str = "",
+    indent: int = 2,
+    merge_data: str = "",
+) -> str:
+    """
+    创建和编辑 JSON (.json) 文件。
+
+    参数:
+        file_path:    JSON 文件路径
+        operation:    操作类型：
+                      - create:   创建新 JSON 文件（已有则覆盖）
+                      - read:     读取 JSON 内容
+                      - write:    写入/更新键值
+                      - delete:   删除指定键
+                      - merge:    合并另一个 JSON 对象
+                      - array:    向数组追加元素
+                      - validate: 验证 JSON 格式
+        data:         create 用：JSON 字符串（如 '{"key": "value"}'）
+                      array 用：要追加的 JSON 值
+        key:          write/delete 用：键名（支持点号路径如 "a.b.c"）
+        value:        write 用：值（JSON 字符串或纯文本）
+        indent:       缩进空格数（默认 2）
+        merge_data:   merge 用：要合并的 JSON 字符串
+    """
+    abs_path = os.path.abspath(file_path)
+
+    def _set_nested(obj, path, val):
+        """设置嵌套键值"""
+        keys = path.split(".")
+        for k in keys[:-1]:
+            if k not in obj or not isinstance(obj[k], dict):
+                obj[k] = {}
+            obj = obj[k]
+        obj[keys[-1]] = val
+
+    def _get_nested(obj, path):
+        """获取嵌套键值"""
+        keys = path.split(".")
+        for k in keys:
+            if isinstance(obj, dict) and k in obj:
+                obj = obj[k]
+            else:
+                return None
+        return obj
+
+    def _delete_nested(obj, path):
+        """删除嵌套键"""
+        keys = path.split(".")
+        for k in keys[:-1]:
+            if isinstance(obj, dict) and k in obj:
+                obj = obj[k]
+            else:
+                return False
+        if isinstance(obj, dict) and keys[-1] in obj:
+            del obj[keys[-1]]
+            return True
+        return False
+
+    # ── create: 创建新文件 ──
+    if operation == "create":
+        try:
+            json_data = json.loads(data) if data else {}
+        except json.JSONDecodeError as e:
+            return f"错误: JSON 格式无效 - {e}"
+        os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
+        with open(abs_path, "w", encoding="utf-8") as f:
+            json.dump(json_data, f, ensure_ascii=False, indent=indent)
+        return f"已创建 {abs_path}"
+
+    # ── read: 读取内容 ──
+    if operation == "read":
+        if not os.path.isfile(abs_path):
+            return f"错误: 文件不存在 {abs_path}"
+        try:
+            with open(abs_path, "r", encoding="utf-8") as f:
+                json_data = json.load(f)
+            return json.dumps(json_data, ensure_ascii=False, indent=indent)
+        except json.JSONDecodeError as e:
+            return f"错误: JSON 格式无效 - {e}"
+
+    # ── validate: 验证格式 ──
+    if operation == "validate":
+        if not os.path.isfile(abs_path):
+            return f"错误: 文件不存在 {abs_path}"
+        try:
+            with open(abs_path, "r", encoding="utf-8") as f:
+                json.load(f)
+            return f"JSON 格式有效: {abs_path}"
+        except json.JSONDecodeError as e:
+            return f"JSON 格式无效: {e}"
+
+    # ── 以下操作需要文件存在 ──
+    if not os.path.isfile(abs_path):
+        return f"错误: 文件不存在 {abs_path}"
+
+    try:
+        with open(abs_path, "r", encoding="utf-8") as f:
+            json_data = json.load(f)
+    except json.JSONDecodeError as e:
+        return f"错误: JSON 格式无效 - {e}"
+
+    # ── write: 写入/更新键值 ──
+    if operation == "write":
+        if not key:
+            return "错误: 请提供 key 参数"
+        try:
+            parsed_value = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            parsed_value = value
+        _set_nested(json_data, key, parsed_value)
+        with open(abs_path, "w", encoding="utf-8") as f:
+            json.dump(json_data, f, ensure_ascii=False, indent=indent)
+        return f"已设置 {key} = {json.dumps(parsed_value, ensure_ascii=False)}"
+
+    # ── delete: 删除键 ──
+    if operation == "delete":
+        if not key:
+            return "错误: 请提供 key 参数"
+        if _delete_nested(json_data, key):
+            with open(abs_path, "w", encoding="utf-8") as f:
+                json.dump(json_data, f, ensure_ascii=False, indent=indent)
+            return f"已删除键 {key}"
+        return f"错误: 键 {key} 不存在"
+
+    # ── merge: 合并 JSON ──
+    if operation == "merge":
+        if not merge_data:
+            return "错误: 请提供 merge_data 参数"
+        try:
+            merge_obj = json.loads(merge_data)
+        except json.JSONDecodeError as e:
+            return f"错误: merge_data JSON 格式无效 - {e}"
+        if isinstance(json_data, dict) and isinstance(merge_obj, dict):
+            json_data.update(merge_obj)
+        else:
+            return "错误: 合并操作仅支持 JSON 对象"
+        with open(abs_path, "w", encoding="utf-8") as f:
+            json.dump(json_data, f, ensure_ascii=False, indent=indent)
+        return f"已合并 JSON 数据"
+
+    # ── array: 向数组追加元素 ──
+    if operation == "array":
+        if not key:
+            return "错误: 请提供 key 参数指定数组路径"
+        arr = _get_nested(json_data, key)
+        if arr is None:
+            arr = []
+            _set_nested(json_data, key, arr)
+        if not isinstance(arr, list):
+            return f"错误: {key} 不是数组"
+        try:
+            parsed_value = json.loads(data)
+        except (json.JSONDecodeError, TypeError):
+            parsed_value = data
+        arr.append(parsed_value)
+        with open(abs_path, "w", encoding="utf-8") as f:
+            json.dump(json_data, f, ensure_ascii=False, indent=indent)
+        return f"已向 {key} 追加元素（当前长度: {len(arr)}）"
+
+    return f"错误: 未知操作 '{operation}'，支持: create, read, write, delete, merge, array, validate"
+
+
+# ══════════════════════════════════════════════════════════════════
 # 己方干员查询工具
 # ══════════════════════════════════════════════════════════════════
 
@@ -2053,6 +2411,1438 @@ def query_story(
         return f"[{story_id}]\n\n{parsed}"
 
     return f"错误: 未知操作 '{operation}'，支持: search, read, list"
+
+
+# ══════════════════════════════════════════════════════════════════
+# MAA 控制工具
+# ══════════════════════════════════════════════════════════════════
+
+import ctypes
+import ctypes.util
+import platform
+import threading
+import time
+
+_maa_lib = None
+_maa_instance = None
+_maa_connected = False
+_maa_log_buffer: list[str] = []
+_maa_log_lock = threading.Lock()
+
+# MAA 回调
+_CallBackType = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p)
+
+
+def _maa_callback(msg: int, detail: bytes, arg):
+    """MAA 回调函数，收集日志"""
+    try:
+        detail_str = detail.decode("utf-8") if detail else ""
+        with _maa_log_lock:
+            _maa_log_buffer.append(f"[{msg}] {detail_str}")
+            if len(_maa_log_buffer) > 200:
+                _maa_log_buffer.pop(0)
+    except Exception:
+        pass
+
+
+_callback_ref = _CallBackType(_maa_callback)
+
+
+def _load_maa(maa_path: str) -> bool:
+    """加载 MaaCore.dll 并初始化资源"""
+    global _maa_lib
+    p = Path(maa_path)
+    dll_path = p / "MaaCore.dll"
+    if not dll_path.exists():
+        return False
+
+    # 把 MAA 目录加入 PATH
+    env_path = os.environ.get("PATH", "")
+    if str(p) not in env_path:
+        os.environ["PATH"] = str(p) + os.pathsep + env_path
+
+    _maa_lib = ctypes.WinDLL(str(dll_path))
+    _set_lib_properties()
+
+    # 加载资源
+    resource_path = p / "resource"
+    if resource_path.exists():
+        _maa_lib.AsstLoadResource(str(p).encode("utf-8"))
+    return True
+
+
+def _set_lib_properties():
+    """设置 ctypes 接口"""
+    _maa_lib.AsstSetUserDir.restype = ctypes.c_bool
+    _maa_lib.AsstSetUserDir.argtypes = (ctypes.c_char_p,)
+    _maa_lib.AsstLoadResource.restype = ctypes.c_bool
+    _maa_lib.AsstLoadResource.argtypes = (ctypes.c_char_p,)
+    _maa_lib.AsstCreate.restype = ctypes.c_void_p
+    _maa_lib.AsstCreate.argtypes = ()
+    _maa_lib.AsstCreateEx.restype = ctypes.c_void_p
+    _maa_lib.AsstCreateEx.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+    _maa_lib.AsstDestroy.argtypes = (ctypes.c_void_p,)
+    _maa_lib.AsstConnect.restype = ctypes.c_bool
+    _maa_lib.AsstConnect.argtypes = (ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p)
+    _maa_lib.AsstAppendTask.restype = ctypes.c_int
+    _maa_lib.AsstAppendTask.argtypes = (ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p)
+    _maa_lib.AsstSetTaskParams.restype = ctypes.c_bool
+    _maa_lib.AsstSetTaskParams.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_char_p)
+    _maa_lib.AsstStart.restype = ctypes.c_bool
+    _maa_lib.AsstStart.argtypes = (ctypes.c_void_p,)
+    _maa_lib.AsstStop.restype = ctypes.c_bool
+    _maa_lib.AsstStop.argtypes = (ctypes.c_void_p,)
+    _maa_lib.AsstRunning.restype = ctypes.c_bool
+    _maa_lib.AsstRunning.argtypes = (ctypes.c_void_p,)
+    _maa_lib.AsstGetVersion.restype = ctypes.c_char_p
+
+
+@mcp.tool()
+def maa_connect(
+    maa_path: str,
+    adb_path: str = "",
+    address: str = "127.0.0.1:5555",
+    config: str = "General",
+) -> str:
+    """
+    连接 MAA 到模拟器/设备。首次调用时加载 MaaCore.dll。
+
+    参数:
+        maa_path:  MAA 安装目录（含 MaaCore.dll 和 resource/），如 "C:/MAA"
+        adb_path:  adb 路径，留空则使用 MAA 自带的 adb
+        address:   设备地址，如 "127.0.0.1:5555"（MuMu）、"127.0.0.1:7555"（雷电）
+        config:    连接配置，默认 "General"
+    """
+    global _maa_lib, _maa_instance, _maa_connected
+
+    try:
+        p = Path(maa_path)
+        if not _maa_lib:
+            if not _load_maa(maa_path):
+                return f"错误: 在 {maa_path} 未找到 MaaCore.dll"
+
+        # 创建实例
+        if _maa_instance:
+            _maa_lib.AsstStop(_maa_instance)
+            _maa_lib.AsstDestroy(_maa_instance)
+        _maa_instance = _maa_lib.AsstCreateEx(_callback_ref, None)
+
+        # 确定 adb 路径
+        if not adb_path:
+            for candidate in ["platform-tools/adb.exe", "adb.exe"]:
+                if (p / candidate).exists():
+                    adb_path = str(p / candidate)
+                    break
+            if not adb_path:
+                adb_path = "adb"
+
+        # 连接
+        ok = _maa_lib.AsstConnect(
+            _maa_instance,
+            adb_path.encode("utf-8"),
+            address.encode("utf-8"),
+            config.encode("utf-8"),
+        )
+        _maa_connected = bool(ok)
+
+        if _maa_connected:
+            ver = _maa_lib.AsstGetVersion().decode("utf-8")
+            return f"连接成功！MAA 版本: {ver}，设备: {address}"
+        else:
+            return f"连接失败。请检查: 1) adb路径是否正确 2) 模拟器是否运行 3) 地址是否正确"
+    except Exception as e:
+        return f"错误: {e}"
+
+
+@mcp.tool()
+def maa_start_task(
+    tasks: str,
+) -> str:
+    """
+    添加并启动 MAA 任务。可同时添加多个任务（按顺序执行）。
+
+    参数:
+        tasks:  任务配置，JSON 数组格式。每个元素: {"type": "任务类型", "params": {参数}}
+                支持的任务类型:
+                - StartUp: 开始唤醒，params: {"client_type": "Official"/"Bilibili", "start_game_enabled": true}
+                - Fight: 刷理智，params: {"stage": "1-7"/"CE-6"/"AP-5"/""(当前关), "times": 99, "medicine": 0}
+                - Recruit: 自动公招，params: {"refresh": true, "select": [4,5], "confirm": [3,4,5]}
+                - Infrast: 基建换班，params: {"facility": ["Mfg","Trade","Power","Control","Reception","Office","Dorm"]}
+                - Mall: 信用购物，params: {"shopping": true}
+                - Award: 领取奖励
+                - Roguelike: 肉鸽，params: {"theme": "Phantom"/"Mizuki"/"Sami"/"Sarkaz"}
+                - Copilot: 自动作业，params: {"filename": "作业JSON路径"}
+                - CloseDown: 关闭游戏
+    示例: [{"type":"StartUp","params":{"client_type":"Official"}},{"type":"Fight","params":{"stage":"1-7","times":5}}]
+    """
+    global _maa_instance, _maa_connected
+
+    if not _maa_instance or not _maa_connected:
+        return "错误: MAA 未连接，请先调用 maa_connect"
+
+    try:
+        # 先停止正在运行的任务
+        if _maa_lib.AsstRunning(_maa_instance):
+            _maa_lib.AsstStop(_maa_instance)
+            time.sleep(0.5)
+
+        task_list = json.loads(tasks)
+        if not isinstance(task_list, list):
+            task_list = [task_list]
+
+        added = []
+        for t in task_list:
+            task_type = t.get("type", "")
+            params = t.get("params", {})
+            task_id = _maa_lib.AsstAppendTask(
+                _maa_instance,
+                task_type.encode("utf-8"),
+                json.dumps(params, ensure_ascii=False).encode("utf-8"),
+            )
+            added.append(f"{task_type}(id={task_id})")
+
+        ok = _maa_lib.AsstStart(_maa_instance)
+        if ok:
+            return f"已启动 {len(added)} 个任务: {', '.join(added)}"
+        else:
+            return "任务启动失败"
+    except json.JSONDecodeError as e:
+        return f"JSON 解析错误: {e}"
+    except Exception as e:
+        return f"错误: {e}"
+
+
+@mcp.tool()
+def maa_stop() -> str:
+    """停止当前所有 MAA 任务。"""
+    global _maa_instance
+    if not _maa_instance:
+        return "MAA 未初始化"
+    _maa_lib.AsstStop(_maa_instance)
+    return "已停止所有任务"
+
+
+@mcp.tool()
+def maa_status() -> str:
+    """查询 MAA 当前状态和最近日志。"""
+    global _maa_instance, _maa_connected
+    if not _maa_instance:
+        return "MAA 未初始化，请先调用 maa_connect"
+
+    running = bool(_maa_lib.AsstRunning(_maa_instance))
+    status = "运行中" if running else "空闲"
+
+    with _maa_log_lock:
+        recent_logs = _maa_log_buffer[-20:]
+
+    # 解析日志提取关键信息
+    info_lines = []
+    for log in recent_logs:
+        try:
+            # 日志格式: [msg_id] json_detail
+            detail = log.split("] ", 1)[1] if "] " in log else log
+            d = json.loads(detail)
+            if "what" in d:
+                info_lines.append(d.get("what", "") + ": " + d.get("details", {}).get("task", d.get("why", "")))
+            elif "details" in d and isinstance(d["details"], dict):
+                sub = d["details"]
+                if "task" in sub:
+                    info_lines.append(sub["task"])
+        except (json.JSONDecodeError, KeyError, TypeError):
+            if len(log) < 200:
+                info_lines.append(log)
+
+    result = f"状态: {status}\n连接: {'已连接' if _maa_connected else '未连接'}\n"
+    if info_lines:
+        result += "\n最近日志:\n" + "\n".join(info_lines[-10:])
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════
+# CSGO/CS2 赛事数据工具（HLTV + Liquipedia + 5EPlay）
+# ══════════════════════════════════════════════════════════════════
+
+import time as _time
+
+# ── cloudscraper 可选导入（惰性初始化） ──
+try:
+    import cloudscraper as _cloudscraper
+    _HAS_CLOUDSCRAPER = True
+except ImportError:
+    _HAS_CLOUDSCRAPER = False
+
+_hltv_session = None
+_hltv_warmed: bool = False
+
+
+def _hltv_get_session():
+    """惰性获取/创建 HLTV session（延迟到首次使用时以避开 Cloudflare 时效问题）。"""
+    global _hltv_session
+    if _hltv_session is not None:
+        return _hltv_session
+
+    if _HAS_CLOUDSCRAPER:
+        _hltv_session = _cloudscraper.create_scraper(
+            browser={
+                "browser": "firefox",
+                "platform": "windows",
+                "mobile": False,
+            }
+        )
+        # 注意: cloudscraper 自行管理 UA/headers，覆盖会破坏 CF 绕过能力
+    else:
+        _hltv_session = requests.Session()
+        _hltv_session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8",
+            "Referer": "https://www.hltv.org/",
+        })
+    return _hltv_session
+
+
+def _hltv_ensure_warmup() -> None:
+    """惰性预热 — 首次调用时访问 HLTV 首页以获取 cf_clearance cookie。
+    若遇到 403 则尝试重建 session 后重试一次。
+    """
+    global _hltv_warmed, _hltv_session
+    if _hltv_warmed:
+        return
+
+    sess = _hltv_get_session()
+
+    def _try_warmup() -> bool:
+        try:
+            resp = sess.get("https://www.hltv.org", timeout=20)
+            if resp.status_code == 200:
+                _time.sleep(1.0)
+                return True
+        except Exception:
+            pass
+        return False
+
+    if _try_warmup():
+        _hltv_warmed = True
+        return
+
+    # 预热 403 — 重建 session 后重试
+    _hltv_session = None
+    sess = _hltv_get_session()
+    if _try_warmup():
+        _hltv_warmed = True
+        return
+
+    # 仍失败 — 标记已尝试，后续请求自行处理
+    _hltv_warmed = True
+
+
+# ── 缓存 ──
+_csgo_cache: dict[str, tuple[float, str]] = {}
+
+_CSGO_TTL = {
+    "matches":     300,    # 5 分钟
+    "results":     3600,   # 1 小时
+    "rankings":    21600,  # 6 小时
+    "tournaments": 3600,   # 1 小时
+    "player":      7200,   # 2 小时
+    "match":       1800,   # 30 分钟（比赛结束后数据不可变）
+    "5eplay":      120,    # 2 分钟（5EPlay 动态渲染，不宜长缓存）
+}
+
+
+def _csgo_cache_get(key: str, ttl: int) -> Optional[str]:
+    entry = _csgo_cache.get(key)
+    if entry and (_time.time() - entry[0]) < ttl:
+        return entry[1]
+    return None
+
+
+def _csgo_cache_set(key: str, data: str) -> None:
+    _csgo_cache[key] = (_time.time(), data)
+
+
+def _hltv_get(url: str, ttl_key: str = "matches") -> str:
+    """发起 HLTV 请求，返回 HTML 文本。带缓存。"""
+    global _hltv_session
+
+    _hltv_ensure_warmup()
+    cache_key = f"hltv:{url}"
+    ttl = _CSGO_TTL.get(ttl_key, 300)
+    cached = _csgo_cache_get(cache_key, ttl)
+    if cached:
+        return cached
+
+    def _do_request():
+        _time.sleep(0.5)
+        return _hltv_get_session().get(url, timeout=15)
+
+    try:
+        resp = _do_request()
+        # 403 — 尝试重建 session 后重试一次
+        if resp.status_code == 403:
+            _hltv_session = None
+            _time.sleep(1.0)
+            _hltv_get_session().get("https://www.hltv.org", timeout=20)
+            _time.sleep(1.0)
+            resp = _do_request()
+
+        if resp.status_code == 403:
+            return "ERROR:403"
+        resp.raise_for_status()
+        _csgo_cache_set(cache_key, resp.text)
+        return resp.text
+    except requests.exceptions.Timeout:
+        return "ERROR:TIMEOUT"
+    except Exception as e:
+        return f"ERROR:{e}"
+
+
+def _5eplay_get(url: str) -> str:
+    """发起 5EPlay 请求，返回 HTML 文本。"""
+    cache_key = f"5eplay:{url}"
+    cached = _csgo_cache_get(cache_key, _CSGO_TTL["5eplay"])
+    if cached:
+        return cached
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.encoding = resp.apparent_encoding
+        _csgo_cache_set(cache_key, resp.text)
+        return resp.text
+    except Exception as e:
+        return f"ERROR:{e}"
+
+
+# ── Liquipedia API 封装 ──
+_last_liquipedia_req: float = 0
+
+
+def _liquipedia_request(endpoint: str, api_key: str, params: dict) -> Optional[dict]:
+    """调用 Liquipedia API，自动限速 1 req/s。"""
+    global _last_liquipedia_req
+    elapsed = _time.time() - _last_liquipedia_req
+    if elapsed < 1.0:
+        _time.sleep(1.0 - elapsed)
+
+    headers = {
+        "apikey": api_key,
+        "Accept": "application/json",
+        "User-Agent": "Mon3tr-MCP/1.0 (https://github.com/Mon3tr-MCP)",
+    }
+    try:
+        resp = requests.get(
+            f"https://api.liquipedia.net/api/v1{endpoint}",
+            headers=headers,
+            params=params,
+            timeout=15,
+        )
+        _last_liquipedia_req = _time.time()
+        if resp.status_code == 200:
+            return resp.json()
+        return None
+    except Exception:
+        return None
+
+
+# ── 比赛详情解析（match detail scraping） ──
+
+
+def _parse_stats_table(table) -> list[dict]:
+    """解析单张 HLTV totalstats 表格，返回选手数据列表。
+
+    预期列：PlayerName | K-D | eK-eD | Swing | ADR | eADR | KAST | eKAST | Rating 3.0
+    """
+    players = []
+    rows = table.select("tbody tr, tr")
+    for row in rows:
+        cells = row.select("td, th")
+        # 至少需要 选手名 + K-D + ADR + Rating 4 列有意义数据
+        if len(cells) < 5:
+            continue
+        name = cells[0].get_text(" ", strip=True)
+        if not name or len(name) < 2:
+            continue
+        # 跳过标题行
+        name_lower = name.lower()
+        if name_lower in ("player", "name", "team", "legacy", "tyloo"):
+            continue
+
+        player = {
+            "name": name,
+            "kd": cells[1].get_text(strip=True) if len(cells) > 1 else "",
+            "adr": cells[4].get_text(strip=True) if len(cells) > 4 else "",
+            "kast": cells[6].get_text(strip=True) if len(cells) > 6 else "",
+            "rating": cells[8].get_text(strip=True) if len(cells) > 8 else "",
+        }
+        players.append(player)
+    return players
+
+
+def _scrape_match_stats(match_id: str) -> list[dict]:
+    """抓取 HLTV 比赛详情页，提取每张地图的选手统计。
+
+    返回结构：
+        [{"map": "Overall"|"Ancient"|..., "team": "Legacy"|"TYLOO", "players": [...]}, ...]
+    """
+    url = f"https://www.hltv.org/matches/{match_id}"
+    raw = _hltv_get(url, "match")
+    if raw.startswith("ERROR:"):
+        return []
+
+    soup = BeautifulSoup(raw, "html.parser")
+
+    all_stats = []
+
+    # 1) 总览: #all-content > table.totalstats
+    overall_div = soup.select_one("#all-content")
+    if overall_div:
+        tables = overall_div.select("table.totalstats")
+        for table in tables:
+            team_name = ""
+            header_cell = table.select_one("tr > th, tr > td")
+            if header_cell:
+                team_name = header_cell.get_text(strip=True)
+            players = _parse_stats_table(table)
+            if players:
+                all_stats.append({
+                    "map": "Overall",
+                    "team": team_name,
+                    "players": players,
+                })
+
+    # 2) 单地图: div[id$="-content"] > .map + table.totalstats
+    map_divs = soup.select("div[id$='-content']")
+    for div in map_divs:
+        map_name_el = div.select_one(".map")
+        map_name = map_name_el.get_text(strip=True) if map_name_el else "Unknown"
+        tables = div.select("table.totalstats")
+        for table in tables:
+            team_name = ""
+            header_cell = table.select_one("tr > th, tr > td")
+            if header_cell:
+                team_name = header_cell.get_text(strip=True)
+            players = _parse_stats_table(table)
+            if players:
+                all_stats.append({
+                    "map": map_name,
+                    "team": team_name,
+                    "players": players,
+                })
+
+    return all_stats
+
+
+# ── 工具 1: csgo_matches ──
+
+@mcp.tool()
+def csgo_matches(
+    match_type: str = "upcoming",
+    source: str = "hltv",
+    offset: int = 0,
+    limit: int = 20,
+) -> str:
+    """
+    获取 CSGO/CS2 比赛信息。
+
+    参数:
+        match_type: 比赛类型 — "upcoming"(即将开始), "results"(已结束), "live"(正在进行)
+        source:     数据源 — "hltv"(HLTV,默认), "5eplay"(5EPlay,中国/亚洲赛事)
+        offset:     分页偏移量（HLTV results 每页 100 条）
+        limit:      最大返回条数（默认 20，上限 50）
+
+    返回:
+        比赛列表，包含队伍名、比分/时间、赛事名、比赛链接
+    """
+    limit = min(max(limit, 1), 50)
+
+    if source == "5eplay":
+        return "⚠️ 5EPlay 使用动态渲染，数据可能不完整。建议使用 source=\"hltv\"\n\n" + _csgo_matches_5eplay(match_type, limit)
+
+    # ── HLTV 数据源 ──
+    if match_type == "upcoming":
+        url = "https://www.hltv.org/matches"
+        ttl_key = "matches"
+    elif match_type == "results":
+        url = f"https://www.hltv.org/results?offset={offset}"
+        ttl_key = "results"
+    elif match_type == "live":
+        url = "https://www.hltv.org/matches"
+        ttl_key = "matches"
+    else:
+        return f"错误: 无效的 match_type '{match_type}'，支持: upcoming, results, live"
+
+    raw = _hltv_get(url, ttl_key)
+    if raw.startswith("ERROR:"):
+        if "403" in raw:
+            return "错误: HLTV 请求被 Cloudflare 拦截，请运行 pip install cloudscraper 安装绕过库"
+        return f"错误: HLTV 请求失败 {raw}"
+
+    soup = BeautifulSoup(raw, "html.parser")
+    results = []
+
+    if match_type in ("upcoming", "live"):
+        # 解析即将开始 / 正在进行的比赛
+        match_containers = soup.select(".upcoming-match")
+        if not match_containers:
+            # 备用选择器
+            match_containers = soup.select("[class*='match']")
+
+        for mc in match_containers:
+            team_els = mc.select(".team-name, .match-teamname .team")
+            if len(team_els) < 2:
+                continue
+            team1 = team_els[0].get_text(strip=True)
+            team2 = team_els[1].get_text(strip=True)
+
+            time_el = mc.select_one(".match-time, .matchInfo .time, [class*='time']")
+            match_time = time_el.get_text(strip=True) if time_el else "未知"
+
+            event_el = mc.select_one(".match-event, .event-name, [class*='event']")
+            event_name = event_el.get_text(strip=True) if event_el else ""
+
+            format_el = mc.select_one(".match-format, [class*='format']")
+            match_format = format_el.get_text(strip=True) if format_el else ""
+
+            link_el = mc.select_one("a[href*='/matches/']")
+            link = ""
+            if link_el:
+                href = link_el.get("href", "")
+                link = f"https://www.hltv.org{href}" if href.startswith("/") else href
+
+            # live 过滤：只保留有 live 标记的
+            if match_type == "live":
+                live_el = mc.select_one("[class*='live']")
+                if not live_el:
+                    continue
+
+            line = f"{team1} vs {team2}"
+            if match_format:
+                line += f" ({match_format})"
+            if event_name:
+                line += f"\n  赛事: {event_name}"
+            line += f"\n  时间: {match_time}"
+            if link:
+                line += f"\n  链接: {link}"
+            results.append(line)
+
+    elif match_type == "results":
+        # 解析已结束的比赛结果
+        result_containers = soup.select(".result-con")
+        if not result_containers:
+            result_containers = soup.select("[class*='result']")
+
+        for rc in result_containers:
+            team_els = rc.select(".team-name, .team")
+            score_els = rc.select(".score")
+            if len(team_els) < 2:
+                continue
+
+            team1 = team_els[0].get_text(strip=True)
+            team2 = team_els[1].get_text(strip=True)
+            score1 = score_els[0].get_text(strip=True) if len(score_els) > 0 else "?"
+            score2 = score_els[1].get_text(strip=True) if len(score_els) > 1 else "?"
+
+            event_el = rc.select_one(".event-name, [class*='event']")
+            event_name = event_el.get_text(strip=True) if event_el else ""
+
+            map_el = rc.select_one(".map-text, [class*='map']")
+            map_played = map_el.get_text(strip=True) if map_el else ""
+
+            link_el = rc.select_one("a[href*='/matches/']")
+            link = ""
+            if link_el:
+                href = link_el.get("href", "")
+                link = f"https://www.hltv.org{href}" if href.startswith("/") else href
+
+            line = f"{team1} {score1} - {score2} {team2}"
+            if event_name:
+                line += f"  [{event_name}]"
+            if map_played:
+                line += f"  ({map_played})"
+            if link:
+                line += f"\n  链接: {link}"
+            results.append(line)
+
+    if not results:
+        return f"未找到{match_type}比赛数据（HLTV 页面结构可能已变化）"
+
+    header = {
+        "upcoming": "HLTV 即将开始的比赛",
+        "results": "HLTV 最近比赛结果",
+        "live": "HLTV 正在进行的比赛",
+    }[match_type]
+
+    output = f"{header}（共 {len(results[:limit])} 场）\n" + "=" * 50 + "\n"
+    output += "\n\n".join(results[:limit])
+    return output
+
+
+def _csgo_matches_5eplay(match_type: str, limit: int) -> str:
+    """从 5EPlay 获取比赛数据。"""
+    url = "https://www.5eplay.com/match"
+    raw = _5eplay_get(url)
+    if raw.startswith("ERROR:"):
+        return f"错误: 5EPlay 请求失败 {raw}"
+
+    soup = BeautifulSoup(raw, "html.parser")
+    results = []
+
+    # 5EPlay 使用动态渲染，尝试解析可见内容
+    match_items = soup.select(
+        ".match-item, .match-list-item, [class*='match-item'], "
+        "[class*='match-card'], .game-item, [class*='game-item']"
+    )
+
+    for item in match_items:
+        team_els = item.select(
+            "[class*='team-name'], [class*='teamName'], "
+            "[class*='team'] .name, .team-name"
+        )
+        if len(team_els) >= 2:
+            team1 = team_els[0].get_text(strip=True)
+            team2 = team_els[1].get_text(strip=True)
+        else:
+            # 尝试通用提取
+            texts = [t.get_text(strip=True) for t in item.select("span, div, p") if t.get_text(strip=True)]
+            if len(texts) >= 2:
+                team1, team2 = texts[0], texts[1]
+            else:
+                continue
+
+        time_el = item.select_one("[class*='time'], [class*='date'], time")
+        match_time = time_el.get_text(strip=True) if time_el else ""
+
+        score_el = item.select_one("[class*='score']")
+        score = score_el.get_text(strip=True) if score_el else ""
+
+        event_el = item.select_one("[class*='event'], [class*='tournament']")
+        event_name = event_el.get_text(strip=True) if event_el else ""
+
+        link_el = item.select_one("a[href]")
+        link = ""
+        if link_el:
+            href = link_el.get("href", "")
+            if href.startswith("/"):
+                link = f"https://www.5eplay.com{href}"
+            elif href.startswith("http"):
+                link = href
+
+        if match_type == "results" and not score:
+            continue
+        if match_type == "upcoming" and score:
+            continue
+
+        line = f"{team1} vs {team2}"
+        if score:
+            line += f"  比分: {score}"
+        if event_name:
+            line += f"\n  赛事: {event_name}"
+        if match_time:
+            line += f"\n  时间: {match_time}"
+        if link:
+            line += f"\n  链接: {link}"
+        results.append(line)
+
+    if not results:
+        return (
+            "未找到 5EPlay 比赛数据。\n"
+            "注意: 5EPlay 使用动态渲染技术，可能需要浏览器环境。\n"
+            "建议使用 source=\"hltv\" 获取更可靠的数据。"
+        )
+
+    header = "5EPlay 比赛数据" if match_type == "upcoming" else "5EPlay 比赛结果"
+    output = f"{header}（共 {len(results[:limit])} 场）\n" + "=" * 50 + "\n"
+    output += "\n\n".join(results[:limit])
+    return output
+
+
+# ── 工具 2: csgo_rankings ──
+
+@mcp.tool()
+def csgo_rankings(region: str = "world", source: str = "hltv") -> str:
+    """
+    获取 CSGO/CS2 战队世界排名。
+
+    参数:
+        region: 排名区域 — "world"(全球), "eu"(欧洲), "na"(北美),
+                "asia"(亚洲), "sa"(南美), "oce"(大洋洲), "cis"(独联体)
+        source: 数据源 — "hltv"(默认), "5eplay"(5EPlay 亚洲排名)
+
+    返回:
+        战队排名列表，包含排名、战队名、积分、阵容
+    """
+    if source == "5eplay":
+        return "⚠️ 5EPlay 使用动态渲染，数据可能不完整。建议使用 source=\"hltv\"\n\n" + _csgo_rankings_5eplay()
+
+    # ── HLTV 排名 ──
+    valid_regions = {"world", "eu", "na", "asia", "sa", "oce", "cis"}
+    if region not in valid_regions:
+        return f"错误: 无效的区域 '{region}'，支持: {', '.join(sorted(valid_regions))}"
+
+    url = "https://www.hltv.org/ranking/teams/"
+    if region != "world":
+        url += region
+
+    raw = _hltv_get(url, "rankings")
+    if raw.startswith("ERROR:"):
+        if "403" in raw:
+            return "错误: HLTV 请求被 Cloudflare 拦截，请运行 pip install cloudscraper 安装绕过库"
+        return f"错误: HLTV 请求失败 {raw}"
+
+    soup = BeautifulSoup(raw, "html.parser")
+    ranked_teams = soup.select(".ranked-team, [class*='ranked-team']")
+
+    if not ranked_teams:
+        return "未找到排名数据（HLTV 页面结构可能已变化）"
+
+    region_name = {
+        "world": "全球", "eu": "欧洲", "na": "北美",
+        "asia": "亚洲", "sa": "南美", "oce": "大洋洲", "cis": "独联体",
+    }[region]
+
+    lines = [f"HLTV {region_name}战队排名（前 {min(30, len(ranked_teams))} 名）", "=" * 50, ""]
+
+    for i, team in enumerate(ranked_teams[:30]):
+        # 排名
+        pos_el = team.select_one(".position, [class*='position']")
+        rank = pos_el.get_text(strip=True) if pos_el else str(i + 1)
+
+        # 战队名
+        name_el = team.select_one(".name, .team-name, [class*='name']")
+        name = name_el.get_text(strip=True) if name_el else "未知"
+
+        # 积分
+        points_el = team.select_one(".points, [class*='points']")
+        points = points_el.get_text(strip=True) if points_el else ""
+
+        # 阵容
+        players = []
+        for nick in team.select(".ranking-nick, [class*='nick'], [class*='player']"):
+            p = nick.get_text(strip=True)
+            if p:
+                players.append(p)
+
+        line = f"  {rank}. {name}"
+        if points:
+            line += f"  ({points}分)"
+        if players:
+            line += f"\n     阵容: {', '.join(players)}"
+        lines.append(line)
+
+    return "\n".join(lines)
+
+
+def _csgo_rankings_5eplay() -> str:
+    """从 5EPlay 获取亚洲战队排名。"""
+    url = "https://www.5eplay.com/ranking"
+    raw = _5eplay_get(url)
+    if raw.startswith("ERROR:"):
+        return f"错误: 5EPlay 请求失败 {raw}"
+
+    soup = BeautifulSoup(raw, "html.parser")
+
+    # 尝试多种选择器
+    rank_items = soup.select(
+        ".rank-item, .team-rank-item, [class*='rank-item'], "
+        "[class*='ranking'] .item, .ranking-list .item, "
+        "table tbody tr"
+    )
+
+    results = []
+    for item in rank_items:
+        cells = item.select("td, [class*='rank'], [class*='team'], [class*='name'], [class*='score']")
+        texts = [c.get_text(strip=True) for c in cells if c.get_text(strip=True)]
+        if len(texts) >= 2:
+            results.append(" | ".join(texts[:5]))
+
+    if not results:
+        # 尝试直接提取所有可见文本中的排名信息
+        all_text = soup.get_text(separator="\n")
+        lines = [ln.strip() for ln in all_text.splitlines() if ln.strip()]
+        # 查找类似 "1. TeamName 1000分" 的模式
+        rank_pattern = re.compile(r"^\d{1,3}[.、\s]")
+        for ln in lines:
+            if rank_pattern.match(ln) and len(ln) < 200:
+                results.append(ln)
+
+    if not results:
+        return (
+            "未找到 5EPlay 排名数据。\n"
+            "注意: 5EPlay 使用动态渲染技术，建议使用 source=\"hltv\" 获取排名。"
+        )
+
+    output = f"5EPlay 战队排名（共 {len(results[:30])} 支）\n" + "=" * 50 + "\n"
+    output += "\n".join(results[:30])
+    return output
+
+
+# ── 工具 3: csgo_tournaments ──
+
+@mcp.tool()
+def csgo_tournaments(
+    status: str = "ongoing",
+    source: str = "hltv",
+    liquipedia_api_key: str = "",
+) -> str:
+    """
+    获取 CSGO/CS2 赛事信息。
+
+    参数:
+        status:            赛事状态 — "ongoing"(进行中), "upcoming"(即将开始), "completed"(已结束)
+        source:            数据源 — "hltv"(默认), "5eplay"(5EPlay), "liquipedia"(仅 Liquipedia)
+        liquipedia_api_key: Liquipedia API Key（可选，提供后会补充赛事详情）
+
+    返回:
+        赛事列表，包含赛事名、日期、奖金池、参赛队伍数
+    """
+    if source == "5eplay":
+        return "⚠️ 5EPlay 使用动态渲染，数据可能不完整。建议使用 source=\"hltv\"\n\n" + _csgo_tournaments_5eplay(status)
+    if source == "liquipedia":
+        if not liquipedia_api_key:
+            return "错误: 使用 Liquipedia 数据源需要提供 liquipedia_api_key 参数\n请在 https://liquipedia.net/counterstrike/Special:ApiAccount 注册获取"
+        return _csgo_tournaments_liquipedia(status, liquipedia_api_key)
+
+    # ── HLTV 赛事 ──
+    if status == "ongoing":
+        url = "https://www.hltv.org/events"
+    elif status == "upcoming":
+        url = "https://www.hltv.org/events"
+    elif status == "completed":
+        url = "https://www.hltv.org/events/archive"
+    else:
+        return f"错误: 无效的 status '{status}'，支持: ongoing, upcoming, completed"
+
+    raw = _hltv_get(url, "tournaments")
+    if raw.startswith("ERROR:"):
+        if "403" in raw:
+            return "错误: HLTV 请求被 Cloudflare 拦截，请运行 pip install cloudscraper 安装绕过库"
+        return f"错误: HLTV 请求失败 {raw}"
+
+    soup = BeautifulSoup(raw, "html.parser")
+    events = soup.select(
+        ".events-page-event, .event-item, [class*='event-card'], "
+        "[class*='event-item'], .big-event, .small-event"
+    )
+
+    results = []
+    for ev in events:
+        name_el = ev.select_one(
+            "[class*='event-name'], [class*='name'], h3, h4, a"
+        )
+        name = name_el.get_text(strip=True) if name_el else ""
+        if not name:
+            continue
+
+        date_el = ev.select_one("[class*='date'], [class*='time'], time")
+        date = date_el.get_text(strip=True) if date_el else ""
+
+        prize_el = ev.select_one("[class*='prize'], [class*='prizepool']")
+        prize = prize_el.get_text(strip=True) if prize_el else ""
+
+        teams_el = ev.select_one("[class*='teams'], [class*='participant']")
+        teams_count = teams_el.get_text(strip=True) if teams_el else ""
+
+        location_el = ev.select_one("[class*='location'], [class*='country']")
+        location = location_el.get_text(strip=True) if location_el else ""
+
+        link_el = ev.select_one("a[href*='/event/'], a[href*='/events/']")
+        link = ""
+        if link_el:
+            href = link_el.get("href", "")
+            link = f"https://www.hltv.org{href}" if href.startswith("/") else href
+
+        line = f"  {name}"
+        if date:
+            line += f"\n    日期: {date}"
+        if location:
+            line += f"\n    地点: {location}"
+        if prize:
+            line += f"\n    奖金: {prize}"
+        if teams_count:
+            line += f"\n    队伍: {teams_count}"
+        if link:
+            line += f"\n    链接: {link}"
+    # ── 按状态过滤 ──
+    if status == "ongoing":
+        results = [
+            r for r, ev in zip(results, events)
+            if ev.select_one("[class*='live'], [class*='ongoing'], .event-live")
+        ]
+    elif status == "upcoming":
+        results = [
+            r for r, ev in zip(results, events)
+            if not ev.select_one("[class*='live'], [class*='ongoing'], .event-live")
+        ]
+    # else: "completed" — 保留全部结果
+
+    # 可选: 补充 Liquipedia 数据
+    if liquipedia_api_key and results:
+        lp_data = _liquipedia_request(
+            "/tournaments",
+            liquipedia_api_key,
+            {"wiki": "counterstrike", "limit": 10, "order": "desc"},
+        )
+        if lp_data and "result" in lp_data:
+            lp_names = {t.get("name", "").lower(): t for t in lp_data["result"]}
+            for i, line in enumerate(results):
+                for lp_name, lp_info in lp_names.items():
+                    if lp_name and lp_name in line.lower():
+                        extras = []
+                        if lp_info.get("prizepool"):
+                            extras.append(f"奖金(Liquipedia): {lp_info['prizepool']}")
+                        if lp_info.get("format"):
+                            extras.append(f"赛制: {lp_info['format']}")
+                        if extras:
+                            results[i] += "\n    " + "\n    ".join(extras)
+
+    if not results:
+        return f"未找到{status}赛事数据（HLTV 页面结构可能已变化）"
+
+    status_name = {"ongoing": "进行中", "upcoming": "即将开始", "completed": "已结束"}[status]
+    output = f"HLTV {status_name}赛事（共 {len(results)} 个）\n" + "=" * 50 + "\n"
+    output += "\n\n".join(results[:20])
+    return output
+
+
+def _csgo_tournaments_5eplay(status: str) -> str:
+    """从 5EPlay 获取赛事信息。"""
+    url = "https://www.5eplay.com/tournament"
+    raw = _5eplay_get(url)
+    if raw.startswith("ERROR:"):
+        return f"错误: 5EPlay 请求失败 {raw}"
+
+    soup = BeautifulSoup(raw, "html.parser")
+
+    # 尝试多种选择器
+    tour_items = soup.select(
+        ".tournament-item, .tournament-card, [class*='tournament-item'], "
+        "[class*='tournament-card'], [class*='event-item'], "
+        ".match-item, [class*='match-item']"
+    )
+
+    results = []
+    for item in tour_items:
+        name_el = item.select_one(
+            "[class*='name'], [class*='title'], h3, h4, a"
+        )
+        name = name_el.get_text(strip=True) if name_el else ""
+        if not name:
+            texts = [t.get_text(strip=True) for t in item.select("span, div, p")]
+            name = texts[0] if texts else ""
+        if not name:
+            continue
+
+        date_el = item.select_one("[class*='date'], [class*='time']")
+        date = date_el.get_text(strip=True) if date_el else ""
+
+        status_el = item.select_one("[class*='status'], [class*='state']")
+        item_status = status_el.get_text(strip=True) if status_el else ""
+
+        prize_el = item.select_one("[class*='prize'], [class*='prizepool']")
+        prize = prize_el.get_text(strip=True) if prize_el else ""
+
+        link_el = item.select_one("a[href]")
+        link = ""
+        if link_el:
+            href = link_el.get("href", "")
+            if href.startswith("/"):
+                link = f"https://www.5eplay.com{href}"
+            elif href.startswith("http"):
+                link = href
+
+        line = f"  {name}"
+        if date:
+            line += f"\n    日期: {date}"
+        if item_status:
+            line += f"\n    状态: {item_status}"
+        if prize:
+            line += f"\n    奖金: {prize}"
+        if link:
+            line += f"\n    链接: {link}"
+        results.append(line)
+
+    if not results:
+        return (
+            "未找到 5EPlay 赛事数据。\n"
+            "注意: 5EPlay 使用动态渲染技术，建议使用 source=\"hltv\" 获取赛事信息。"
+        )
+
+    output = f"5EPlay 赛事列表（共 {len(results)} 个）\n" + "=" * 50 + "\n"
+    output += "\n\n".join(results[:20])
+    return output
+
+
+def _csgo_tournaments_liquipedia(status: str, api_key: str) -> str:
+    """从 Liquipedia API 获取赛事信息。"""
+    status_map = {
+        "ongoing": "ongoing",
+        "upcoming": "upcoming",
+        "completed": "completed",
+    }
+    lp_status = status_map.get(status, "")
+
+    params = {"wiki": "counterstrike", "limit": 20}
+    if lp_status:
+        params["conditions"] = f"[[status::{lp_status}]]"
+
+    data = _liquipedia_request("/tournaments", api_key, params)
+    if not data or "result" not in data:
+        return "错误: Liquipedia API 请求失败，请检查 API Key 是否有效"
+
+    tournaments = data["result"]
+    if not tournaments:
+        return f"未找到 Liquipedia {status} 赛事"
+
+    status_name = {"ongoing": "进行中", "upcoming": "即将开始", "completed": "已结束"}[status]
+    lines = [f"Liquipedia {status_name}赛事（共 {len(tournaments)} 个）", "=" * 50, ""]
+
+    for t in tournaments:
+        name = t.get("name", "未知")
+        line = f"  {name}"
+        if t.get("dates"):
+            line += f"\n    日期: {t['dates']}"
+        if t.get("location"):
+            line += f"\n    地点: {t['location']}"
+        if t.get("prizepool"):
+            line += f"\n    奖金: {t['prizepool']}"
+        if t.get("format"):
+            line += f"\n    赛制: {t['format']}"
+        if t.get("participantcount"):
+            line += f"\n    参赛队伍: {t['participantcount']}"
+        if t.get("pagename"):
+            line += f"\n    链接: https://liquipedia.net/counterstrike/{t['pagename']}"
+        lines.append(line)
+
+    return "\n".join(lines)
+
+
+# ── 工具 4: csgo_match_detail ──
+
+@mcp.tool()
+def csgo_match_detail(match_id: str) -> str:
+    """
+    获取 HLTV 比赛详情，包含每张地图的选手统计数据（Rating 3.0、K-D、ADR 等）。
+
+    参数:
+        match_id: 比赛 ID，可从 csgo_matches 返回的链接中提取
+                  例: "2394896/legacy-vs-tyloo-iem-cologne-major-2026-stage-2"
+
+    返回:
+        每张地图的双方选手统计数据
+    """
+    if not match_id or "/" not in match_id:
+        return "错误: match_id 格式无效，例: 2394896/legacy-vs-tyloo-iem-cologne-major-2026-stage-2"
+
+    stats = _scrape_match_stats(match_id)
+    if not stats:
+        return (
+            f"错误: 无法获取比赛 {match_id} 的数据。\n"
+            "可能原因: 比赛ID不存在、HLTV 请求被拦截、或页面结构变化。"
+        )
+
+    output = f"HLTV 比赛详情: {match_id}\n{'=' * 60}\n"
+
+    # 按 map 分组（Overall + 各单图）
+    for block in stats:
+        map_name = block["map"]
+        team = block.get("team", "")
+        players = block.get("players", [])
+
+        header = f"\n📊 {map_name}"
+        if team:
+            header += f" — {team}"
+        output += header + f"\n{'-' * 40}\n"
+
+        for p in players:
+            output += (
+                f"  {p['name']:<28s} "
+                f"K-D: {p['kd']:<9s} "
+                f"ADR: {p['adr']:<7s} "
+                f"KAST: {p['kast']:<7s} "
+                f"Rating: {p['rating']}\n"
+            )
+
+    return output
+
+
+# ── 选手搜索 / 资料页抓取 ──
+
+
+def _search_hltv_player(query: str) -> list[tuple[str, str]]:
+    """在 HLTV 搜索选手，返回 [(显示名, player_path), ...]。
+    player_path 形如 "20702/jee"。
+    """
+    _hltv_ensure_warmup()
+    try:
+        _time.sleep(0.3)
+        resp = _hltv_get_session().get(
+            f"https://www.hltv.org/search?query={query}",
+            timeout=10,
+            headers={
+                "X-Requested-With": "XMLHttpRequest",
+                "Accept": "text/html, */*",
+                "Referer": "https://www.hltv.org/",
+            },
+        )
+        if resp.status_code != 200:
+            return []
+    except Exception:
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    results: list[tuple[str, str]] = []
+    seen = set()
+    for a in soup.select("a[href*='/player/']"):
+        href = a.get("href", "")
+        name = a.get_text(strip=True)
+        # 过滤 Faceit 等无关链接
+        if "#tab-faceit" in href or not name or len(name) < 2:
+            continue
+        # 提取纯路径 "20702/jee"
+        path = href.rstrip("/").split("/player/")[-1].split("#")[0]
+        if path not in seen:
+            seen.add(path)
+            results.append((name, path))
+    return results
+
+
+def _scrape_player_profile(player_path: str) -> dict:
+    """抓取 HLTV 选手资料页，提取统计摘要和近期比赛。
+
+    返回:
+        {"name": ..., "team": ..., "rating": ..., "stats": {...}, "recent_matches": [...]}
+    """
+    url = f"https://www.hltv.org/player/{player_path}"
+    raw = _hltv_get(url, "player")
+    if raw.startswith("ERROR:"):
+        return {}
+
+    soup = BeautifulSoup(raw, "html.parser")
+
+    result: dict = {"name": "", "team": "", "rating": "", "stats": {}, "recent_matches": []}
+
+    # 选手名
+    name_el = soup.select_one(".playerNickname, h1")
+    if name_el:
+        result["name"] = name_el.get_text(strip=True)
+
+    # 战队
+    team_el = soup.select_one(".playerTeam a, .playerTeam, [class*='team'] a")
+    if team_el:
+        result["team"] = team_el.get_text(strip=True)
+
+    # Rating 3.0（近3个月）
+    for stat_div in soup.select(".player-stat"):
+        label_el = stat_div.select_one("b")
+        value_el = stat_div.select_one(".statsVal p, .statsVal")
+        if label_el and value_el:
+            label = label_el.get_text(strip=True)
+            value = value_el.get_text(strip=True)
+            if "Rating" in label:
+                result["rating"] = value
+            result["stats"][label] = value
+
+    # 近期比赛
+    results_section = soup.find("h2", string=lambda t: t and "latest results" in t.lower())
+    if results_section:
+        table = results_section.find_next("table")
+        if table:
+            for row in table.select("tbody tr, tr"):
+                cells = row.select("td, th")
+                if len(cells) < 2:
+                    continue
+                texts = [c.get_text(" ", strip=True) for c in cells]
+                if texts and any(t for t in texts if t):
+                    result["recent_matches"].append(texts)
+
+    return result
+
+
+# ── 工具 5: csgo_player_stats ──
+
+@mcp.tool()
+def csgo_player_stats(
+    query: str = "",
+    stat_type: str = "rating",
+    maps_filter: int = 0,
+    source: str = "hltv",
+    player_id: str = "",
+    match_id: str = "",
+) -> str:
+    """
+    获取 CSGO/CS2 选手统计数据。
+
+    参数:
+        query:       选手名搜索（为空则返回排行榜）
+        stat_type:   统计类型 — "rating"(Rating 2.0), "kills"(击杀), "deaths"(死亡),
+                     "adr"(ADR), "headshot"(爆头率), "clutch"(残局胜率)
+        maps_filter: 最低场次过滤（0 = 使用 HLTV 默认值）
+        source:      数据源 — "hltv"(默认), "5eplay"(5EPlay)
+
+    返回:
+        选手统计列表
+    """
+    if source == "5eplay":
+        return "⚠️ 5EPlay 使用动态渲染，数据可能不完整。建议使用 source=\"hltv\"\n\n" + _csgo_player_stats_5eplay(query, stat_type)
+
+    valid_stats = {"rating", "kills", "deaths", "adr", "headshot", "clutch"}
+    if stat_type not in valid_stats:
+        return f"错误: 无效的 stat_type '{stat_type}'，支持: {', '.join(sorted(valid_stats))}"
+
+    stat_labels = {
+        "rating": "Rating 3.0",
+        "kills": "击杀",
+        "deaths": "死亡",
+        "adr": "ADR",
+        "headshot": "爆头率",
+        "clutch": "残局胜率",
+    }
+
+    # ── 模式 1: 比赛详情 ──
+    if match_id:
+        stats = _scrape_match_stats(match_id)
+        if not stats:
+            return f"错误: 无法获取比赛 {match_id} 的数据"
+        output = f"HLTV 比赛选手 {stat_labels[stat_type]}\n{'=' * 50}\n"
+        for block in stats:
+            output += f"\n📊 {block['map']} — {block.get('team', '')}\n{'-' * 30}\n"
+            for p in block.get("players", []):
+                output += (
+                    f"  {p['name']:<28s}  K-D: {p['kd']:<7s}  "
+                    f"ADR: {p['adr']:<6s}  Rating: {p['rating']}\n"
+                )
+        return output
+
+    # ── 模式 2: 指定选手 ID ──
+    if player_id:
+        profile = _scrape_player_profile(player_id)
+        if not profile:
+            return f"错误: 无法获取选手 {player_id} 的数据"
+        return _format_player_profile(profile, stat_type)
+
+    # ── 模式 3: 选手名搜索 ──
+    if query:
+        players = _search_hltv_player(query)
+        if not players:
+            return f"未找到选手: {query}"
+
+        # 精确匹配优先
+        query_lower = query.lower()
+        exact = [(n, p) for n, p in players if query_lower == n.lower() or query_lower in n.lower().split("'")[-1].strip("'")]
+        candidates = exact if exact else players[:5]
+
+        output = f"HLTV 搜索: {query}（找到 {len(players)} 个结果）\n{'=' * 50}\n"
+        for name, path in candidates:
+            profile = _scrape_player_profile(path)
+            if profile:
+                output += _format_player_profile(profile, stat_type)
+                output += "\n" + "-" * 40 + "\n"
+            else:
+                output += f"  {name} — 无法获取详细数据\n"
+        return output
+
+    # ── 模式 4: 无参数（返回提示） ──
+    return (
+        "⚠️ HLTV /stats/players 端点受 Cloudflare 严格保护，此模式暂不可用。\n\n"
+        "请使用以下方式获取选手数据:\n"
+        "  1. 名称搜索: csgo_player_stats(query=\"Jee\")\n"
+        "  2. 指定选手: csgo_player_stats(player_id=\"20702/jee\")\n"
+        "  3. 比赛详情: csgo_player_stats(match_id=\"2394896/legacy-vs-tyloo-...\")\n"
+        "  4. 5EPlay:   csgo_player_stats(query=\"Jee\", source=\"5eplay\")\n"
+    )
+
+
+def _format_player_profile(profile: dict, stat_type: str) -> str:
+    """将 _scrape_player_profile 的结果格式化为文本输出。"""
+    lines = []
+    name = profile.get("name", "未知")
+    team = profile.get("team", "")
+    rating = profile.get("rating", "")
+    stats = profile.get("stats", {})
+    recent = profile.get("recent_matches", [])
+
+    header = f"🎮 {name}"
+    if team:
+        header += f" | {team}"
+    if rating:
+        header += f" | Rating 3.0: {rating}"
+    lines.append(header)
+
+    # 详细属性
+    if stats:
+        other = {k: v for k, v in stats.items() if "Rating" not in k}
+        if other:
+            parts = [f"{k}: {v}" for k, v in list(other.items())[:5]]
+            lines.append("  " + "  |  ".join(parts))
+
+    # 近期比赛
+    if recent:
+        lines.append(f"\n  📅 近期比赛（共 {len(recent)} 场）:")
+        for match in recent[:5]:
+            texts = match if isinstance(match, list) else [match]
+            line = "    " + "  |  ".join(str(t) for t in texts[:5])
+            lines.append(line)
+
+    return "\n".join(lines)
+
+
+def _csgo_player_stats_5eplay(query: str, stat_type: str) -> str:
+    """从 5EPlay 获取选手统计。"""
+    if query:
+        url = f"https://www.5eplay.com/player?name={query}"
+    else:
+        url = "https://www.5eplay.com/ranking/player"
+
+    raw = _5eplay_get(url)
+    if raw.startswith("ERROR:"):
+        return f"错误: 5EPlay 请求失败 {raw}"
+
+    soup = BeautifulSoup(raw, "html.parser")
+
+    # 尝试解析选手列表
+    player_items = soup.select(
+        ".player-item, .player-rank-item, [class*='player-item'], "
+        "[class*='player-card'], table tbody tr"
+    )
+
+    results = []
+    for item in player_items:
+        cells = item.select("td, [class*='name'], [class*='team'], [class*='rating'], [class*='stat']")
+        texts = [c.get_text(strip=True) for c in cells if c.get_text(strip=True)]
+        if len(texts) >= 2:
+            results.append(" | ".join(texts[:6]))
+
+    if not results:
+        # 尝试从页面文本中提取
+        all_text = soup.get_text(separator="\n")
+        lines = [ln.strip() for ln in all_text.splitlines() if ln.strip()]
+        for ln in lines:
+            if re.search(r"\d+\.\d+", ln) and len(ln) < 200 and len(ln) > 10:
+                results.append(ln)
+
+    if not results:
+        return (
+            "未找到 5EPlay 选手数据。\n"
+            "注意: 5EPlay 使用动态渲染技术，建议使用 source=\"hltv\" 获取选手统计。"
+        )
+
+    header = f"5EPlay 选手统计"
+    if query:
+        header = f"5EPlay 搜索: {query}"
+    output = f"{header}（共 {len(results[:20])} 条）\n" + "=" * 50 + "\n"
+    output += "\n".join(results[:20])
+    return output
 
 
 # ══════════════════════════════════════════════════════════════════

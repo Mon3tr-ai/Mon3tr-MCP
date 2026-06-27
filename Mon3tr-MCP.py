@@ -2749,7 +2749,7 @@ _CSGO_TTL = {
     "tournaments": 3600,   # 1 小时
     "player":      7200,   # 2 小时
     "match":       1800,   # 30 分钟（比赛结束后数据不可变）
-    "5eplay":      120,    # 2 分钟（5EPlay 动态渲染，不宜长缓存）
+    "5eplay_api":  120,    # 2 分钟（5EPlay API 进行中比赛）
 }
 
 
@@ -2800,28 +2800,59 @@ def _hltv_get(url: str, ttl_key: str = "matches") -> str:
         return f"ERROR:{e}"
 
 
-def _5eplay_get(url: str) -> str:
-    """发起 5EPlay 请求，返回 HTML 文本。"""
-    cache_key = f"5eplay:{url}"
-    cached = _csgo_cache_get(cache_key, _CSGO_TTL["5eplay"])
+# ── 5EPlay API 封装 ──
+_5EPLAY_LIST_URL = "https://app.5eplay.com/api/tournament/session_list"
+_5EPLAY_MATCH_URL = "https://esports-data.5eplaycdn.com/v1/api/csgo/matches"
+_5EPLAY_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/149.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+    "Referer": "https://event.5eplay.com/",
+    "Origin": "https://event.5eplay.com",
+}
+
+_5EPLAY_STATUS_MAP = {
+    "upcoming": 0,
+    "ongoing": 1,
+    "live": 1,
+    "results": 2,
+}
+
+
+def _5eplay_api_get(url: str, params: dict = None, ttl: int = 120) -> Optional[dict]:
+    """调用 5EPlay API，返回解析后的 JSON dict。带缓存。"""
+    import time as _time
+    cache_key = f"5eapi:{url}:{json.dumps(params or {}, sort_keys=True)}"
+    cached = _csgo_cache_get(cache_key, ttl)
     if cached:
-        return cached
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    }
+        try:
+            return json.loads(cached)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
     try:
-        resp = requests.get(url, headers=headers, timeout=15)
-        resp.encoding = resp.apparent_encoding
-        _csgo_cache_set(cache_key, resp.text)
-        return resp.text
-    except Exception as e:
-        return f"ERROR:{e}"
+        resp = requests.get(url, headers=_5EPLAY_HEADERS, params=params, timeout=15)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        _csgo_cache_set(cache_key, json.dumps(data, ensure_ascii=False))
+        return data
+    except Exception:
+        return None
+
+
+def _5eplay_match_detail(match_id: str) -> Optional[dict]:
+    """获取 5EPlay 比赛详情（含选手统计、veto、半场比分等）。
+    返回 data.match 对象，包含 mc_info, tt_info, global_state, bouts_state 等。
+    """
+    url = f"{_5EPLAY_MATCH_URL}/{match_id}/data"
+    data = _5eplay_api_get(url, ttl=120)
+    if data and data.get("success"):
+        return data.get("data", {}).get("match", {})
+    return None
 
 
 # ── Liquipedia API 封装 ──
@@ -2889,44 +2920,144 @@ def _parse_stats_table(table) -> list[dict]:
     return players
 
 
-def _scrape_match_stats(match_id: str) -> list[dict]:
-    """抓取 HLTV 比赛详情页，提取每张地图的选手统计。
+def _scrape_map_scores(soup) -> list[dict]:
+    """从 HLTV 比赛详情页提取每张地图的比分和 veto 信息。
+
+    解析 .mapholder 元素，提取地图名、双方比分、半场比分、胜负标记。
+
+    返回结构：
+        [{"map": "Mirage", "status": "played",
+          "team1": {"name": "Legacy", "score": "13", "result": "won"},
+          "team2": {"name": "TYLOO", "score": "7", "result": "lost"},
+          "half_scores": "(8:4;5:3)", "mapstats_id": "231176"}, ...]
+    """
+    map_scores: list[dict] = []
+    for mh in soup.select(".mapholder"):
+        map_name_el = mh.select_one(".mapname")
+        map_name = map_name_el.get_text(strip=True) if map_name_el else "Unknown"
+
+        # 判断是否已打 (played vs optional)
+        status_el = mh.select_one(".played, .optional")
+        status_classes = status_el.get("class", []) if status_el else []
+        status = "played" if "played" in status_classes else "optional"
+
+        team1: dict = {"name": "", "score": "", "result": ""}
+        team2: dict = {"name": "", "score": "", "result": ""}
+        half_scores = ""
+        mapstats_id = ""
+
+        results = mh.select_one(".results")
+        if results:
+            # 提取 mapstats_id
+            stats_link = results.select_one("a.results-stats")
+            if stats_link:
+                href = stats_link.get("href", "")
+                m = re.search(r"/mapstatsid/(\d+)/", href)
+                if m:
+                    mapstats_id = m.group(1)
+
+            # 提取半场比分
+            half_el = results.select_one(".results-center-half-score")
+            if half_el:
+                half_scores = half_el.get_text(strip=True)
+
+            # 提取队伍1 (左侧)
+            left = results.select_one(".results-left")
+            if left:
+                left_classes = left.get("class", [])
+                if "won" in left_classes:
+                    team1["result"] = "won"
+                elif "lost" in left_classes:
+                    team1["result"] = "lost"
+                else:
+                    team1["result"] = "tie"
+                name_el = left.select_one(".results-teamname")
+                score_el = left.select_one(".results-team-score")
+                team1["name"] = name_el.get_text(strip=True) if name_el else ""
+                team1["score"] = score_el.get_text(strip=True) if score_el else ""
+
+            # 提取队伍2 (右侧)
+            right = results.select_one(".results-right")
+            if right:
+                right_classes = right.get("class", [])
+                if "won" in right_classes:
+                    team2["result"] = "won"
+                elif "lost" in right_classes:
+                    team2["result"] = "lost"
+                else:
+                    team2["result"] = "tie"
+                name_el = right.select_one(".results-teamname")
+                score_el = right.select_one(".results-team-score")
+                team2["name"] = name_el.get_text(strip=True) if name_el else ""
+                team2["score"] = score_el.get_text(strip=True) if score_el else ""
+
+        map_scores.append({
+            "map": map_name,
+            "status": status,
+            "team1": team1,
+            "team2": team2,
+            "half_scores": half_scores,
+            "mapstats_id": mapstats_id,
+        })
+
+    return map_scores
+
+
+def _scrape_veto_info(soup) -> str:
+    """提取比赛 veto/选图信息。"""
+    veto_boxes = soup.select(".veto-box")
+    if not veto_boxes:
+        return ""
+
+    parts: list[str] = []
+    for box in veto_boxes:
+        text = box.get_text(" ", strip=True)
+        text = re.sub(r"\s{2,}", " ", text)
+        if text and len(text) > 2:
+            parts.append(text)
+
+    # 按序号分行：查找编号列表和普通文本
+    result = " ".join(parts)
+    # 在序号前插入换行: "2. TYLOO" -> "\n2. TYLOO"
+    result = re.sub(r"(?<=\S)\s*(\d+\.\s)", r"\n\1", result)
+    return result
+
+
+def _scrape_match_stats(soup, map_scores: Optional[list] = None) -> list[dict]:
+    """从 HLTV 比赛详情页 soup 提取每张地图的选手统计。
+
+    参数:
+        soup:       比赛详情页的 BeautifulSoup 对象
+        map_scores: 可选，_scrape_map_scores() 的返回值，用于将 stats-content
+                    div id 映射到地图名
 
     返回结构：
         [{"map": "Overall"|"Ancient"|..., "team": "Legacy"|"TYLOO", "players": [...]}, ...]
     """
-    url = f"https://www.hltv.org/matches/{match_id}"
-    raw = _hltv_get(url, "match")
-    if raw.startswith("ERROR:"):
-        return []
+    # 构建 mapstats_id → 地图名 的映射
+    id_to_map: dict = {}
+    if map_scores:
+        for ms in map_scores:
+            mid = ms.get("mapstats_id", "")
+            if mid:
+                id_to_map[mid] = ms["map"]
 
-    soup = BeautifulSoup(raw, "html.parser")
+    all_stats: list[dict] = []
 
-    all_stats = []
+    # 遍历所有 .stats-content div（#all-content 及每个地图的 #{mapstatsid}-content）
+    for content_div in soup.select(".stats-content"):
+        div_id = content_div.get("id", "")
 
-    # 1) 总览: #all-content > table.totalstats
-    overall_div = soup.select_one("#all-content")
-    if overall_div:
-        tables = overall_div.select("table.totalstats")
-        for table in tables:
-            team_name = ""
-            header_cell = table.select_one("tr > th, tr > td")
-            if header_cell:
-                team_name = header_cell.get_text(strip=True)
-            players = _parse_stats_table(table)
-            if players:
-                all_stats.append({
-                    "map": "Overall",
-                    "team": team_name,
-                    "players": players,
-                })
+        # 确定地图名
+        if div_id == "all-content":
+            map_name = "Overall"
+        elif div_id.endswith("-content"):
+            stats_id = div_id.replace("-content", "")
+            map_name = id_to_map.get(stats_id, f"Map({stats_id})")
+        else:
+            continue
 
-    # 2) 单地图: div[id$="-content"] > .map + table.totalstats
-    map_divs = soup.select("div[id$='-content']")
-    for div in map_divs:
-        map_name_el = div.select_one(".map")
-        map_name = map_name_el.get_text(strip=True) if map_name_el else "Unknown"
-        tables = div.select("table.totalstats")
+        tables = content_div.select("table.totalstats")
         for table in tables:
             team_name = ""
             header_cell = table.select_one("tr > th, tr > td")
@@ -2967,7 +3098,7 @@ def csgo_matches(
     limit = min(max(limit, 1), 50)
 
     if source == "5eplay":
-        return "⚠️ 5EPlay 使用动态渲染，数据可能不完整。建议使用 source=\"hltv\"\n\n" + _csgo_matches_5eplay(match_type, limit)
+        return _csgo_matches_5eplay(match_type, limit)
 
     # ── HLTV 数据源 ──
     if match_type == "upcoming":
@@ -2977,8 +3108,13 @@ def csgo_matches(
         url = f"https://www.hltv.org/results?offset={offset}"
         ttl_key = "results"
     elif match_type == "live":
-        url = "https://www.hltv.org/matches"
-        ttl_key = "matches"
+        # HLTV 的 live 标记依赖 JS 动态渲染，HTML 抓取不可靠
+        return (
+            "⚠️ HLTV live 模式不可靠（依赖动态渲染）。\n"
+            "请使用 source=\"5eplay\" 获取实时比赛:\n"
+            "  csgo_matches(match_type=\"live\", source=\"5eplay\")\n\n"
+            + _csgo_matches_5eplay("live", limit)
+        )
     else:
         return f"错误: 无效的 match_type '{match_type}'，支持: upcoming, results, live"
 
@@ -3019,12 +3155,6 @@ def csgo_matches(
             if link_el:
                 href = link_el.get("href", "")
                 link = f"https://www.hltv.org{href}" if href.startswith("/") else href
-
-            # live 过滤：只保留有 live 标记的
-            if match_type == "live":
-                live_el = mc.select_one("[class*='live']")
-                if not live_el:
-                    continue
 
             line = f"{team1} vs {team2}"
             if match_format:
@@ -3089,82 +3219,74 @@ def csgo_matches(
 
 
 def _csgo_matches_5eplay(match_type: str, limit: int) -> str:
-    """从 5EPlay 获取比赛数据。"""
-    url = "https://www.5eplay.com/match"
-    raw = _5eplay_get(url)
-    if raw.startswith("ERROR:"):
-        return f"错误: 5EPlay 请求失败 {raw}"
+    """从 5EPlay API 获取比赛数据（含每图比分）。"""
+    gs = _5EPLAY_STATUS_MAP.get(match_type)
+    if gs is None:
+        return f"错误: 无效的 match_type '{match_type}'"
 
-    soup = BeautifulSoup(raw, "html.parser")
-    results = []
+    data = _5eplay_api_get(_5EPLAY_LIST_URL, {
+        "game_status": gs, "game_type": 1, "grades": "", "page": 1, "limit": limit,
+    }, ttl=120 if match_type == "ongoing" else 300)
 
-    # 5EPlay 使用动态渲染，尝试解析可见内容
-    match_items = soup.select(
-        ".match-item, .match-list-item, [class*='match-item'], "
-        "[class*='match-card'], .game-item, [class*='game-item']"
-    )
+    if not data or not data.get("success"):
+        return "错误: 5EPlay API 请求失败"
 
-    for item in match_items:
-        team_els = item.select(
-            "[class*='team-name'], [class*='teamName'], "
-            "[class*='team'] .name, .team-name"
-        )
-        if len(team_els) >= 2:
-            team1 = team_els[0].get_text(strip=True)
-            team2 = team_els[1].get_text(strip=True)
-        else:
-            # 尝试通用提取
-            texts = [t.get_text(strip=True) for t in item.select("span, div, p") if t.get_text(strip=True)]
-            if len(texts) >= 2:
-                team1, team2 = texts[0], texts[1]
-            else:
-                continue
+    matches = data.get("data", {}).get("matches", [])
+    if not matches:
+        return f"5EPlay 未找到{match_type}比赛"
 
-        time_el = item.select_one("[class*='time'], [class*='date'], time")
-        match_time = time_el.get_text(strip=True) if time_el else ""
+    results: list[str] = []
+    type_name = {"upcoming": "即将开始", "ongoing": "进行中", "live": "LIVE", "results": "已结束"}[match_type]
+    is_live = match_type == "live"
 
-        score_el = item.select_one("[class*='score']")
-        score = score_el.get_text(strip=True) if score_el else ""
+    for m in matches:
+        info = m.get("mc_info", {})
+        state = m.get("state", {})
+        t1 = info.get("t1_info", {})
+        t2 = info.get("t2_info", {})
 
-        event_el = item.select_one("[class*='event'], [class*='tournament']")
-        event_name = event_el.get_text(strip=True) if event_el else ""
+        t1n = t1.get("disp_name", "TBD")
+        t2n = t2.get("disp_name", "TBD")
 
-        link_el = item.select_one("a[href]")
-        link = ""
-        if link_el:
-            href = link_el.get("href", "")
-            if href.startswith("/"):
-                link = f"https://www.5eplay.com{href}"
-            elif href.startswith("http"):
-                link = href
+        line = f"{t1n} vs {t2n}"
 
-        if match_type == "results" and not score:
-            continue
-        if match_type == "upcoming" and score:
-            continue
+        # 赛事 + 轮次
+        stage = info.get("tt_stage_desc", "") or info.get("round_name", "")
+        if stage:
+            line += f"\n  赛事: {stage}"
+        line += f"  (BO{info.get('format', '?')})"
 
-        line = f"{team1} vs {team2}"
-        if score:
-            line += f"  比分: {score}"
-        if event_name:
-            line += f"\n  赛事: {event_name}"
-        if match_time:
-            line += f"\n  时间: {match_time}"
-        if link:
-            line += f"\n  链接: {link}"
-        results.append(line)
+        if match_type != "upcoming":
+            bouts = state.get("bout_states", [])
+            for b in bouts:
+                if b.get("display") != "1":
+                    continue
+                mname = b.get("map_name", "?")
+                s1 = b.get("t1_score", "?")
+                s2 = b.get("t2_score", "?")
+                status = b.get("status", "0")
 
-    if not results:
-        return (
-            "未找到 5EPlay 比赛数据。\n"
-            "注意: 5EPlay 使用动态渲染技术，可能需要浏览器环境。\n"
-            "建议使用 source=\"hltv\" 获取更可靠的数据。"
-        )
+                if status == "2":
+                    # 已完成的地图
+                    fh = f"{b.get('t1_fh_rounds','?')}:{b.get('t2_fh_rounds','?')}"
+                    sh = f"{b.get('t1_sc_rounds','?')}:{b.get('t2_sc_rounds','?')}"
+                    line += f"\n    {mname}: {s1}-{s2} (FH {fh}, SH {sh})"
+                elif status == "1":
+                    # 正在打的地图 🔴
+                    rn = b.get("round_num", "?")
+                    line += f"\n    🔴 {mname}: {s1}-{s2} (第{rn}回合)"
 
-    header = "5EPlay 比赛数据" if match_type == "upcoming" else "5EPlay 比赛结果"
-    output = f"{header}（共 {len(results[:limit])} 场）\n" + "=" * 50 + "\n"
-    output += "\n\n".join(results[:limit])
-    return output
+            # 总分
+            qs1 = state.get("t1_quick_score", "")
+            qs2 = state.get("t2_quick_score", "")
+            if qs1 or qs2:
+                line += f"\n  总比分: {qs1}-{qs2}"
+
+        link = f"  详情ID: {info.get('id', '')}"
+        results.append(f"{line}\n{link}")
+
+    header = f"5EPlay {type_name}比赛（共 {len(results)} 场）"
+    return f"{header}\n{'=' * 50}\n" + "\n\n".join(results)
 
 
 # ── 工具 2: csgo_rankings ──
@@ -3183,7 +3305,7 @@ def csgo_rankings(region: str = "world", source: str = "hltv") -> str:
         战队排名列表，包含排名、战队名、积分、阵容
     """
     if source == "5eplay":
-        return "⚠️ 5EPlay 使用动态渲染，数据可能不完整。建议使用 source=\"hltv\"\n\n" + _csgo_rankings_5eplay()
+        return _csgo_rankings_5eplay()
 
     # ── HLTV 排名 ──
     valid_regions = {"world", "eu", "na", "asia", "sa", "oce", "cis"}
@@ -3244,47 +3366,39 @@ def csgo_rankings(region: str = "world", source: str = "hltv") -> str:
 
 
 def _csgo_rankings_5eplay() -> str:
-    """从 5EPlay 获取亚洲战队排名。"""
-    url = "https://www.5eplay.com/ranking"
-    raw = _5eplay_get(url)
-    if raw.startswith("ERROR:"):
-        return f"错误: 5EPlay 请求失败 {raw}"
+    """从 5EPlay API 提取战队排名（从比赛数据中获取队伍排名信息）。"""
+    # 尝试从正在进行的比赛中提取队伍排名
+    data = _5eplay_api_get(_5EPLAY_LIST_URL, {
+        "game_status": 1, "game_type": 1, "grades": "", "page": 1, "limit": 10,
+    }, ttl=300)
 
-    soup = BeautifulSoup(raw, "html.parser")
+    if not data or not data.get("success"):
+        return "错误: 5EPlay API 请求失败"
 
-    # 尝试多种选择器
-    rank_items = soup.select(
-        ".rank-item, .team-rank-item, [class*='rank-item'], "
-        "[class*='ranking'] .item, .ranking-list .item, "
-        "table tbody tr"
-    )
+    matches = data.get("data", {}).get("matches", [])
+    teams: dict[str, dict] = {}
+    for m in matches:
+        info = m.get("mc_info", {})
+        for side in ("t1_info", "t2_info"):
+            t = info.get(side, {})
+            tid = t.get("id", "")
+            if tid and tid not in teams:
+                rank = t.get("rank", "")
+                if rank and str(rank).isdigit():
+                    teams[tid] = {
+                        "name": t.get("disp_name", "?"),
+                        "rank": int(rank),
+                        "logo": t.get("logo", ""),
+                    }
 
-    results = []
-    for item in rank_items:
-        cells = item.select("td, [class*='rank'], [class*='team'], [class*='name'], [class*='score']")
-        texts = [c.get_text(strip=True) for c in cells if c.get_text(strip=True)]
-        if len(texts) >= 2:
-            results.append(" | ".join(texts[:5]))
+    if not teams:
+        return "5EPlay 暂未提供战队排名 API，建议使用 source=\"hltv\" 获取排名"
 
-    if not results:
-        # 尝试直接提取所有可见文本中的排名信息
-        all_text = soup.get_text(separator="\n")
-        lines = [ln.strip() for ln in all_text.splitlines() if ln.strip()]
-        # 查找类似 "1. TeamName 1000分" 的模式
-        rank_pattern = re.compile(r"^\d{1,3}[.、\s]")
-        for ln in lines:
-            if rank_pattern.match(ln) and len(ln) < 200:
-                results.append(ln)
-
-    if not results:
-        return (
-            "未找到 5EPlay 排名数据。\n"
-            "注意: 5EPlay 使用动态渲染技术，建议使用 source=\"hltv\" 获取排名。"
-        )
-
-    output = f"5EPlay 战队排名（共 {len(results[:30])} 支）\n" + "=" * 50 + "\n"
-    output += "\n".join(results[:30])
-    return output
+    ranked = sorted(teams.values(), key=lambda x: x["rank"])[:30]
+    lines = [f"5EPlay 战队排名（从赛事数据提取，共 {len(ranked)} 支）", "=" * 50, ""]
+    for t in ranked:
+        lines.append(f"  #{t['rank']}  {t['name']}")
+    return "\n".join(lines)
 
 
 # ── 工具 3: csgo_tournaments ──
@@ -3307,7 +3421,7 @@ def csgo_tournaments(
         赛事列表，包含赛事名、日期、奖金池、参赛队伍数
     """
     if source == "5eplay":
-        return "⚠️ 5EPlay 使用动态渲染，数据可能不完整。建议使用 source=\"hltv\"\n\n" + _csgo_tournaments_5eplay(status)
+        return _csgo_tournaments_5eplay(status)
     if source == "liquipedia":
         if not liquipedia_api_key:
             return "错误: 使用 Liquipedia 数据源需要提供 liquipedia_api_key 参数\n请在 https://liquipedia.net/counterstrike/Special:ApiAccount 注册获取"
@@ -3416,71 +3530,47 @@ def csgo_tournaments(
 
 
 def _csgo_tournaments_5eplay(status: str) -> str:
-    """从 5EPlay 获取赛事信息。"""
-    url = "https://www.5eplay.com/tournament"
-    raw = _5eplay_get(url)
-    if raw.startswith("ERROR:"):
-        return f"错误: 5EPlay 请求失败 {raw}"
+    """从 5EPlay API 获取赛事信息。"""
+    gs_map = {"ongoing": 1, "upcoming": 0, "completed": 2}
+    gs = gs_map.get(status, 1)
 
-    soup = BeautifulSoup(raw, "html.parser")
+    data = _5eplay_api_get(_5EPLAY_LIST_URL, {
+        "game_status": gs, "game_type": 1, "grades": "", "page": 1, "limit": 10,
+    }, ttl=300)
 
-    # 尝试多种选择器
-    tour_items = soup.select(
-        ".tournament-item, .tournament-card, [class*='tournament-item'], "
-        "[class*='tournament-card'], [class*='event-item'], "
-        ".match-item, [class*='match-item']"
-    )
+    if not data or not data.get("success"):
+        return "错误: 5EPlay API 请求失败"
 
-    results = []
-    for item in tour_items:
-        name_el = item.select_one(
-            "[class*='name'], [class*='title'], h3, h4, a"
-        )
-        name = name_el.get_text(strip=True) if name_el else ""
-        if not name:
-            texts = [t.get_text(strip=True) for t in item.select("span, div, p")]
-            name = texts[0] if texts else ""
-        if not name:
-            continue
+    matches = data.get("data", {}).get("matches", [])
+    if not matches:
+        return f"5EPlay 未找到{status}赛事"
 
-        date_el = item.select_one("[class*='date'], [class*='time']")
-        date = date_el.get_text(strip=True) if date_el else ""
+    # 从比赛数据中聚合赛事信息
+    tournaments: dict[str, dict] = {}
+    for m in matches:
+        info = m.get("mc_info", {})
+        tt_stage = info.get("tt_stage_desc", "") or info.get("tt_stage", "")
+        if tt_stage and tt_stage not in tournaments:
+            t1 = info.get("t1_info", {})
+            t2 = info.get("t2_info", {})
+            tournaments[tt_stage] = {
+                "stage": tt_stage,
+                "format": f"BO{info.get('format', '?')}",
+                "teams": f"{t1.get('disp_name', '?')} vs {t2.get('disp_name', '?')}",
+                "round": info.get("round_name", ""),
+            }
 
-        status_el = item.select_one("[class*='status'], [class*='state']")
-        item_status = status_el.get_text(strip=True) if status_el else ""
+    if not tournaments:
+        return f"5EPlay 未找到{status}赛事，建议使用 source=\"hltv\""
 
-        prize_el = item.select_one("[class*='prize'], [class*='prizepool']")
-        prize = prize_el.get_text(strip=True) if prize_el else ""
-
-        link_el = item.select_one("a[href]")
-        link = ""
-        if link_el:
-            href = link_el.get("href", "")
-            if href.startswith("/"):
-                link = f"https://www.5eplay.com{href}"
-            elif href.startswith("http"):
-                link = href
-
-        line = f"  {name}"
-        if date:
-            line += f"\n    日期: {date}"
-        if item_status:
-            line += f"\n    状态: {item_status}"
-        if prize:
-            line += f"\n    奖金: {prize}"
-        if link:
-            line += f"\n    链接: {link}"
-        results.append(line)
-
-    if not results:
-        return (
-            "未找到 5EPlay 赛事数据。\n"
-            "注意: 5EPlay 使用动态渲染技术，建议使用 source=\"hltv\" 获取赛事信息。"
-        )
-
-    output = f"5EPlay 赛事列表（共 {len(results)} 个）\n" + "=" * 50 + "\n"
-    output += "\n\n".join(results[:20])
-    return output
+    status_name = {"ongoing": "进行中", "upcoming": "即将开始", "completed": "已结束"}[status]
+    lines = [f"5EPlay {status_name}赛事（共 {len(tournaments)} 个）", "=" * 50, ""]
+    for t in list(tournaments.values())[:20]:
+        lines.append(f"  {t['stage']} ({t['format']})")
+        lines.append(f"    对阵: {t['teams']}")
+        if t["round"]:
+            lines.append(f"    轮次: {t['round']}")
+    return "\n".join(lines)
 
 
 def _csgo_tournaments_liquipedia(status: str, api_key: str) -> str:
@@ -3530,48 +3620,141 @@ def _csgo_tournaments_liquipedia(status: str, api_key: str) -> str:
 # ── 工具 4: csgo_match_detail ──
 
 @mcp.tool()
-def csgo_match_detail(match_id: str) -> str:
+def csgo_match_detail(match_id: str, source: str = "hltv") -> str:
     """
-    获取 HLTV 比赛详情，包含每张地图的选手统计数据（Rating 3.0、K-D、ADR 等）。
+    获取比赛详情，包含每张地图的比分、半场比分、veto 信息及选手统计数据。
 
     参数:
-        match_id: 比赛 ID，可从 csgo_matches 返回的链接中提取
-                  例: "2394896/legacy-vs-tyloo-iem-cologne-major-2026-stage-2"
+        match_id: 比赛 ID
+                  HLTV 格式: "2394896/legacy-vs-tyloo-iem-cologne-major-2026-stage-2"
+                  5EPlay 格式: "csgo_mc_2394896" 或纯数字 "2394896"
+        source:   数据源 — "hltv"(默认), "5eplay"
 
     返回:
-        每张地图的双方选手统计数据
+        比赛总览（总比分）、地图选择（veto）、每张地图比分（含半场）、
+        每张地图双方选手统计数据（Rating、K-D、ADR、KAST、HS% 等）
     """
+    if source == "5eplay":
+        return _csgo_match_detail_5eplay(match_id)
+
     if not match_id or "/" not in match_id:
         return "错误: match_id 格式无效，例: 2394896/legacy-vs-tyloo-iem-cologne-major-2026-stage-2"
 
-    stats = _scrape_match_stats(match_id)
-    if not stats:
+    url = f"https://www.hltv.org/matches/{match_id}"
+    raw = _hltv_get(url, "match")
+    if raw.startswith("ERROR:"):
+        if "403" in raw:
+            return "错误: HLTV 请求被 Cloudflare 拦截，请运行 pip install cloudscraper 安装绕过库"
+        return f"错误: 无法获取比赛 {match_id} 的数据 ({raw})"
+
+    soup = BeautifulSoup(raw, "html.parser")
+
+    # 1) 提取地图比分
+    map_scores = _scrape_map_scores(soup)
+    if not map_scores:
         return (
-            f"错误: 无法获取比赛 {match_id} 的数据。\n"
+            f"错误: 无法解析比赛 {match_id} 的地图数据。\n"
             "可能原因: 比赛ID不存在、HLTV 请求被拦截、或页面结构变化。"
         )
 
-    output = f"HLTV 比赛详情: {match_id}\n{'=' * 60}\n"
+    # 2) 提取 veto 信息
+    veto_info = _scrape_veto_info(soup)
 
-    # 按 map 分组（Overall + 各单图）
-    for block in stats:
-        map_name = block["map"]
-        team = block.get("team", "")
-        players = block.get("players", [])
+    # 3) 提取选手统计
+    stats = _scrape_match_stats(soup, map_scores)
 
-        header = f"\n📊 {map_name}"
-        if team:
-            header += f" — {team}"
-        output += header + f"\n{'-' * 40}\n"
+    # ═══ 格式化输出 ═══
 
-        for p in players:
-            output += (
-                f"  {p['name']:<28s} "
-                f"K-D: {p['kd']:<9s} "
-                f"ADR: {p['adr']:<7s} "
-                f"KAST: {p['kast']:<7s} "
-                f"Rating: {p['rating']}\n"
-            )
+    # ── 提取比赛元信息 ──
+    # 从 <title> 提取赛事名
+    title_el = soup.select_one("title")
+    event_name = ""
+    if title_el:
+        title_text = title_el.get_text(strip=True)
+        # 格式: "Legacy vs. TYLOO at IEM Cologne Major 2026 Stage 2 | HLTV.org"
+        m = re.search(r"\s+at\s+(.+?)\s*\|", title_text)
+        if m:
+            event_name = m.group(1).strip()
+
+    # 整体比分
+    score_el = soup.select_one(".score")
+    overall_score = score_el.get_text(strip=True) if score_el else ""
+
+    output = f"HLTV 比赛详情\n{'=' * 60}\n"
+
+    # ── 比赛概要 ──
+    played_maps = [ms for ms in map_scores if ms["status"] == "played"]
+    team1_name = played_maps[0]["team1"]["name"] if played_maps else (map_scores[0]["team1"]["name"] if map_scores else "Team1")
+    team2_name = played_maps[0]["team2"]["name"] if played_maps else (map_scores[0]["team2"]["name"] if map_scores else "Team2")
+
+    output += f"\n⚔️  {team1_name}  vs  {team2_name}\n"
+    if event_name:
+        output += f"📡 赛事: {event_name}\n"
+    if overall_score:
+        output += f"📊 总比分: {overall_score}\n"
+
+    if played_maps:
+        team1_wins = sum(1 for ms in played_maps if ms["team1"]["result"] == "won")
+        team2_wins = sum(1 for ms in played_maps if ms["team2"]["result"] == "won")
+        output += f"🎯 最终: {team1_name} [{team1_wins}] — [{team2_wins}] {team2_name}"
+        output += f"  (BO{len(map_scores)}, 已打 {len(played_maps)} 张)\n"
+
+    # ── 地图选择 (Veto) ──
+    if veto_info:
+        output += f"\n📋 地图选择 (Veto)\n{'-' * 40}\n"
+        veto_lines = veto_info.split("\n")
+        for line in veto_lines:
+            line = line.strip()
+            if line:
+                # 标注格式行
+                if re.match(r"^(Best of|BO\d)", line, re.IGNORECASE):
+                    output += f"  📌 {line}\n"
+                elif re.match(r"^\d+\.", line):
+                    output += f"     {line}\n"
+                else:
+                    output += f"  {line}\n"
+
+    # ── 每张地图比分 ──
+    if played_maps:
+        output += f"\n🗺️  地图比分\n{'-' * 40}\n"
+        for ms in map_scores:
+            if ms["status"] == "played":
+                t1 = ms["team1"]
+                t2 = ms["team2"]
+                winner_mark = "👑" if t1["result"] == "won" else ("👑" if t2["result"] == "won" else "")
+                output += (
+                    f"  {ms['map']:<12s} "
+                    f"{t1['name']} {t1['score']} — {t2['score']} {t2['name']}"
+                )
+                if ms["half_scores"]:
+                    output += f"    半场: {ms['half_scores']}"
+                output += "\n"
+            else:
+                output += f"  {ms['map']:<12s} (未进行)\n"
+
+    # ── 选手统计 ──
+    if stats:
+        output += f"\n📊 选手统计 (Rating 3.0)\n{'=' * 60}\n"
+        for block in stats:
+            map_name = block["map"]
+            team = block.get("team", "")
+            players = block.get("players", [])
+
+            header = f"\n📊 {map_name}"
+            if team:
+                header += f" — {team}"
+            output += header + f"\n{'-' * 40}\n"
+
+            for p in players:
+                output += (
+                    f"  {p['name']:<28s} "
+                    f"K-D: {p['kd']:<9s} "
+                    f"ADR: {p['adr']:<7s} "
+                    f"KAST: {p['kast']:<7s} "
+                    f"Rating: {p['rating']}\n"
+                )
+    else:
+        output += "\n⚠️ 未找到选手统计数据（页面可能未包含 stats 表格）\n"
 
     return output
 
@@ -3694,7 +3877,9 @@ def csgo_player_stats(
         选手统计列表
     """
     if source == "5eplay":
-        return "⚠️ 5EPlay 使用动态渲染，数据可能不完整。建议使用 source=\"hltv\"\n\n" + _csgo_player_stats_5eplay(query, stat_type)
+        if match_id:
+            return _csgo_player_stats_5eplay_match(match_id, stat_type)
+        return _csgo_player_stats_5eplay(query, stat_type)
 
     valid_stats = {"rating", "kills", "deaths", "adr", "headshot", "clutch"}
     if stat_type not in valid_stats:
@@ -3711,10 +3896,34 @@ def csgo_player_stats(
 
     # ── 模式 1: 比赛详情 ──
     if match_id:
-        stats = _scrape_match_stats(match_id)
+        url = f"https://www.hltv.org/matches/{match_id}"
+        raw = _hltv_get(url, "match")
+        if raw.startswith("ERROR:"):
+            return f"错误: 无法获取比赛 {match_id} 的数据 ({raw})"
+        soup = BeautifulSoup(raw, "html.parser")
+        map_scores = _scrape_map_scores(soup)
+        stats = _scrape_match_stats(soup, map_scores)
         if not stats:
-            return f"错误: 无法获取比赛 {match_id} 的数据"
+            return f"错误: 无法解析比赛 {match_id} 的选手数据"
         output = f"HLTV 比赛选手 {stat_labels[stat_type]}\n{'=' * 50}\n"
+        # 地图比分概览
+        if map_scores:
+            played = [ms for ms in map_scores if ms["status"] == "played"]
+            if played:
+                t1n = played[0]["team1"]["name"]
+                t2n = played[0]["team2"]["name"]
+                t1w = sum(1 for ms in played if ms["team1"]["result"] == "won")
+                t2w = sum(1 for ms in played if ms["team2"]["result"] == "won")
+                output += f"\n🏆 {t1n} [{t1w}] - [{t2w}] {t2n}\n"
+                for ms in map_scores:
+                    if ms["status"] == "played":
+                        t1 = ms["team1"]
+                        t2 = ms["team2"]
+                        output += f"  {ms['map']}: {t1['name']} {t1['score']} - {t2['score']} {t2['name']}"
+                        if ms["half_scores"]:
+                            output += f"  {ms['half_scores']}"
+                        output += "\n"
+                output += "\n"
         for block in stats:
             output += f"\n📊 {block['map']} — {block.get('team', '')}\n{'-' * 30}\n"
             for p in block.get("players", []):
@@ -3797,51 +4006,297 @@ def _format_player_profile(profile: dict, stat_type: str) -> str:
     return "\n".join(lines)
 
 
+def _csgo_match_detail_5eplay(match_id: str) -> str:
+    """从 5EPlay API 获取比赛详情（地图比分、veto、选手统计）。"""
+    # 兼容多种 ID 格式: "csgo_mc_2394896" / "2394896" / "2394896/slug"
+    mid = match_id.strip()
+    if not mid.startswith("csgo_mc_"):
+        # 从 HLTV 格式提取数字 ID
+        m = re.match(r"(\d+)", mid)
+        if m:
+            mid = f"csgo_mc_{m.group(1)}"
+        else:
+            return f"错误: match_id 格式无效，例: csgo_mc_2394896 或 2394896"
+
+    detail = _5eplay_match_detail(mid)
+    if not detail:
+        return f"错误: 无法获取 5EPlay 比赛 {mid} 的数据"
+
+    mc = detail.get("mc_info", {})
+    tt = detail.get("tt_info", {})
+    gs = detail.get("global_state", {})
+    t1_info = mc.get("t1_info", {})
+    t2_info = mc.get("t2_info", {})
+
+    t1n = t1_info.get("disp_name", "T1")
+    t2n = t2_info.get("disp_name", "T2")
+    t1s = gs.get("t1_score", "?")
+    t2s = gs.get("t2_score", "?")
+    fmt = mc.get("format", "?")
+
+    # ═══ 输出 ═══
+    output = f"5EPlay 比赛详情\n{'=' * 60}\n"
+
+    # ── 概要 ──
+    output += f"\n⚔️  {t1n}  vs  {t2n}\n"
+    output += f"📡 赛事: {tt.get('disp_name', '?')}"
+    output += f"  |  {tt.get('grade_label', '?')}"
+    output += f"  |  奖金: {tt.get('bonus', '?')}"
+    output += f"  |  地点: {tt.get('addr', '?')}\n"
+    output += f"📊 总比分: {t1n} [{t1s}] — [{t2s}] {t2n}"
+    output += f"  (BO{fmt})\n"
+
+    # ── Veto ──
+    bp_maps = gs.get("bp_map_item", [])
+    if bp_maps:
+        output += f"\n📋 地图选择 (Veto)\n{'-' * 40}\n"
+        for bp in bp_maps:
+            act = "❌ ban" if bp.get("bp_type") == "ban" else "✅ pick"
+            side = t1n if bp.get("team_side") == "t1" else t2n
+            output += f"  {side} {act} {bp.get('map_name', '?')}\n"
+        # 标注 decider
+        if len(bp_maps) >= 7:
+            last = bp_maps[-1]
+            output += f"  ⚡ {last.get('map_name', '?')} 被留下\n"
+
+    # ── 每图比分 ──
+    bouts = detail.get("bouts_state", [])
+    played_bouts = [
+        b for b in bouts
+        if b.get("status") == "2" and b.get("t1_stats", {}).get("all_score", "")
+    ]
+    if played_bouts:
+        output += f"\n🗺️  地图比分\n{'-' * 40}\n"
+        for b in bouts:
+            t1s_map = b.get("t1_stats", {})
+            t2s_map = b.get("t2_stats", {})
+            all1 = t1s_map.get("all_score", "")
+            all2 = t2s_map.get("all_score", "")
+            map_name = b.get("map_name", "?")
+
+            if not all1 and not all2:
+                output += f"  {map_name:<12s} (未进行)\n"
+                continue
+
+            fh1, fh2 = t1s_map.get("fh_score", "?"), t2s_map.get("fh_score", "?")
+            sh1, sh2 = t1s_map.get("sh_score", "?"), t2s_map.get("sh_score", "?")
+            ot1, ot2 = t1s_map.get("ot_score", "0"), t2s_map.get("ot_score", "0")
+
+            half_str = f"(FH {fh1}:{fh2} SH {sh1}:{sh2}"
+            if ot1 or ot2:
+                half_str += f" OT {ot1}:{ot2}"
+            half_str += ")"
+
+            output += f"  {map_name:<12s} {t1n} {all1} — {all2} {t2n}"
+            output += f"    {half_str}\n"
+
+    # ── MVP + 赔率 ──
+    mvp = gs.get("mvp_player_stats", {})
+    if mvp and mvp.get("name"):
+        output += f"\n🌟 MVP: {mvp.get('name', '?')}"
+        output += f"  Rating: {mvp.get('rating', '?')}  ADR: {mvp.get('adr', '?')}"
+        output += f"  K-D: {mvp.get('kill','?')}-{mvp.get('death','?')}\n"
+
+    t1_odds = gs.get("t1_odds", "")
+    if t1_odds:
+        output += f"\n💰 赔率: {t1n} {t1_odds} ({gs.get('t1_odds_percent','?')}%)"
+        output += f"  |  {t2n} {gs.get('t2_odds','?')} ({gs.get('t2_odds_percent','?')}%)\n"
+
+    # ── 全场聚合统计 ──
+    output += f"\n📊 全场选手统计\n{'=' * 60}\n"
+    for side_key, side_name in [("t1_player_stats", t1n), ("t2_player_stats", t2n)]:
+        players = gs.get(side_key, [])
+        if not players:
+            continue
+        output += f"\n  {side_name}\n  {'-' * 40}\n"
+        for p in players:
+            name = p.get("name", "?")
+            kd = f"{p.get('kill','?')}-{p.get('death','?')}"
+            output += (
+                f"  {name:<20s} "
+                f"K-D: {kd:<8s} "
+                f"ADR: {str(p.get('adr','?')):<7s} "
+                f"KAST: {str(p.get('kast','?')):<7s} "
+                f"HS%: {str(p.get('head_shot_rate','?')):<7s} "
+                f"Rating: {p.get('rating','?')}\n"
+            )
+
+    # ── 每图选手统计 ──
+    if played_bouts:
+        output += f"\n📊 每图选手统计\n{'=' * 60}\n"
+        for b in played_bouts:
+            map_name = b.get("map_name", "?")
+            output += f"\n📊 {map_name}\n{'-' * 40}\n"
+            for side_key, side_name in [("t1_pr_stats", t1n), ("t2_pr_stats", t2n)]:
+                players = b.get(side_key, [])
+                if not players:
+                    continue
+                output += f"\n  {side_name}\n"
+                for p in players:
+                    name = p.get("name", "?")
+                    kd = f"{p.get('kill','?')}-{p.get('death','?')}"
+                    output += (
+                        f"  {name:<20s} "
+                        f"K-D: {kd:<8s} "
+                        f"ADR: {str(p.get('adr','?')):<7s} "
+                        f"KAST: {str(p.get('kast','?')):<7s} "
+                        f"HS%: {str(p.get('head_shot_rate','?')):<7s} "
+                        f"Rating: {p.get('rating','?')}\n"
+                    )
+
+    return output
+
+
+def _csgo_player_stats_5eplay_match(match_id: str, stat_type: str) -> str:
+    """从 5EPlay 比赛详情 API 获取指定比赛的选手统计。"""
+    detail = _5eplay_match_detail(match_id)
+    if not detail:
+        return f"错误: 无法获取 5EPlay 比赛 {match_id} 的数据"
+
+    mc = detail.get("mc_info", {})
+    tt = detail.get("tt_info", {})
+    gs = detail.get("global_state", {})
+    t1_info = mc.get("t1_info", {})
+    t2_info = mc.get("t2_info", {})
+
+    t1n = t1_info.get("disp_name", "T1")
+    t2n = t2_info.get("disp_name", "T2")
+    t1s = gs.get("t1_score", "?")
+    t2s = gs.get("t2_score", "?")
+
+    output = f"5EPlay 比赛选手统计\n{'=' * 60}\n"
+    output += f"\n⚔️  {t1n} [{t1s}] — [{t2s}] {t2n}\n"
+    output += f"📡 {tt.get('disp_name', '?')}"
+    output += f"  |  {tt.get('grade_label', '?')}"
+    output += f"  |  奖金: {tt.get('bonus', '?')}"
+    output += f"  |  地点: {tt.get('addr', '?')}\n"
+
+    # Veto
+    bp_maps = gs.get("bp_map_item", [])
+    if bp_maps:
+        output += f"\n📋 地图选择\n{'-' * 40}\n"
+        for bp in bp_maps:
+            act = "ban" if bp.get("bp_type") == "ban" else "pick"
+            side = t1n if bp.get("team_side") == "t1" else t2n
+            output += f"  {side} {act} {bp.get('map_name', '?')}\n"
+
+    # 每图比分 + 选手统计
+    bouts = detail.get("bouts_state", [])
+    for b in bouts:
+        if b.get("status") != "2":
+            continue
+        map_name = b.get("map_name", "?")
+        t1s_map = b.get("t1_stats", {})
+        t2s_map = b.get("t2_stats", {})
+
+        output += f"\n🗺️  {map_name}: {t1s_map.get('all_score','?')} — {t2s_map.get('all_score','?')}"
+        output += f"  (FH {t1s_map.get('fh_score','?')}:{t2s_map.get('fh_score','?')}"
+        output += f" SH {t1s_map.get('sh_score','?')}:{t2s_map.get('sh_score','?')}"
+        ot1 = t1s_map.get("ot_score", "0")
+        ot2 = t2s_map.get("ot_score", "0")
+        if ot1 or ot2:
+            output += f" OT {ot1}:{ot2}"
+        output += ")\n"
+
+        # 选手统计
+        for side_key, side_name in [("t1_pr_stats", t1n), ("t2_pr_stats", t2n)]:
+            players = b.get(side_key, [])
+            output += f"\n  {side_name}\n  {'-' * 30}\n"
+            for p in players:
+                name = p.get("name", "?")
+                rating = p.get("rating", "?")
+                adr = p.get("adr", "?")
+                kd = f"{p.get('kill','?')}-{p.get('death','?')}"
+                kast = p.get("kast", "?")
+                hs = p.get("head_shot_rate", "?")
+                output += (
+                    f"  {name:<20s} "
+                    f"K-D: {kd:<8s} "
+                    f"ADR: {str(adr):<7s} "
+                    f"KAST: {str(kast):<7s} "
+                    f"HS%: {str(hs):<7s} "
+                    f"Rating: {rating}\n"
+                )
+
+    return output
+
+
 def _csgo_player_stats_5eplay(query: str, stat_type: str) -> str:
-    """从 5EPlay 获取选手统计。"""
-    if query:
-        url = f"https://www.5eplay.com/player?name={query}"
-    else:
-        url = "https://www.5eplay.com/ranking/player"
-
-    raw = _5eplay_get(url)
-    if raw.startswith("ERROR:"):
-        return f"错误: 5EPlay 请求失败 {raw}"
-
-    soup = BeautifulSoup(raw, "html.parser")
-
-    # 尝试解析选手列表
-    player_items = soup.select(
-        ".player-item, .player-rank-item, [class*='player-item'], "
-        "[class*='player-card'], table tbody tr"
-    )
-
-    results = []
-    for item in player_items:
-        cells = item.select("td, [class*='name'], [class*='team'], [class*='rating'], [class*='stat']")
-        texts = [c.get_text(strip=True) for c in cells if c.get_text(strip=True)]
-        if len(texts) >= 2:
-            results.append(" | ".join(texts[:6]))
-
-    if not results:
-        # 尝试从页面文本中提取
-        all_text = soup.get_text(separator="\n")
-        lines = [ln.strip() for ln in all_text.splitlines() if ln.strip()]
-        for ln in lines:
-            if re.search(r"\d+\.\d+", ln) and len(ln) < 200 and len(ln) > 10:
-                results.append(ln)
-
-    if not results:
+    """从 5EPlay API 获取选手统计（先搜 session_list，再按需拉 detail）。"""
+    if not query:
         return (
-            "未找到 5EPlay 选手数据。\n"
-            "注意: 5EPlay 使用动态渲染技术，建议使用 source=\"hltv\" 获取选手统计。"
+            "5EPlay 选手统计需要提供 match_id 或 query 参数。\n"
+            "用法: csgo_player_stats(query=\"队伍名\", source=\"5eplay\") 或\n"
+            "      csgo_player_stats(match_id=\"csgo_mc_xxxxx\", source=\"5eplay\")"
         )
 
-    header = f"5EPlay 选手统计"
-    if query:
-        header = f"5EPlay 搜索: {query}"
-    output = f"{header}（共 {len(results[:20])} 条）\n" + "=" * 50 + "\n"
-    output += "\n".join(results[:20])
+    # 第一阶段：只从 session_list 搜索匹配的比赛 ID（轻量，最多 2 页）
+    candidate_ids: list[str] = []
+    q = query.lower()
+    for gs, pages in [(1, 1), (2, 2)]:  # 进行中1页，已结束2页
+        for page in range(1, pages + 1):
+            data = _5eplay_api_get(_5EPLAY_LIST_URL, {
+                "game_status": gs, "game_type": 1, "grades": "",
+                "page": page, "limit": 30,
+            }, ttl=120 if gs == 1 else 600)
+            if not data or not data.get("success"):
+                continue
+            for m in data.get("data", {}).get("matches", []):
+                info = m.get("mc_info", {})
+                t1n = info.get("t1_info", {}).get("disp_name", "").lower()
+                t2n = info.get("t2_info", {}).get("disp_name", "").lower()
+                if q in t1n or q in t2n:
+                    mid = info.get("id", "")
+                    if mid and mid not in candidate_ids:
+                        candidate_ids.append(mid)
+            if len(candidate_ids) >= 3:
+                break
+        if len(candidate_ids) >= 3:
+            break
+
+    if not candidate_ids:
+        return f"5EPlay 未找到与 '{query}' 相关的比赛。\n提示: 5EPlay 只保留约 10 页近期比赛，较早的比赛请用 HLTV。"
+
+    # 第二阶段：只对前 2 个候选拉取完整 detail（之前每个都拉，现在最多 2 次）
+    output = f"5EPlay 选手统计: {query}\n{'=' * 60}\n"
+    shown = 0
+    for mid in candidate_ids[:2]:
+        detail = _5eplay_match_detail(mid)
+        if not detail:
+            continue
+        shown += 1
+
+        mc = detail.get("mc_info", {})
+        tt = detail.get("tt_info", {})
+        t1_info = mc.get("t1_info", {})
+        t2_info = mc.get("t2_info", {})
+
+        output += f"\n📡 {tt.get('disp_name', '?')}"
+        output += f"  |  {t1_info.get('disp_name', '?')} vs {t2_info.get('disp_name', '?')}\n"
+
+        # 全场聚合统计
+        gs = detail.get("global_state", {})
+        for side_key, side_label in [("t1_player_stats", t1_info.get("disp_name", "T1")),
+                                      ("t2_player_stats", t2_info.get("disp_name", "T2"))]:
+            players = gs.get(side_key, [])
+            if players:
+                output += f"\n  {side_label}\n  {'-' * 30}\n"
+                for p in players[:5]:
+                    name = p.get("name", "?")
+                    kd = f"{p.get('kill','?')}-{p.get('death','?')}"
+                    output += (
+                        f"  {name:<20s} "
+                        f"K-D: {kd:<8s} "
+                        f"ADR: {str(p.get('adr','?')):<7s} "
+                        f"KAST: {str(p.get('kast','?')):<7s} "
+                        f"Rating: {p.get('rating','?')}\n"
+                    )
+
+    if shown == 0:
+        return f"5EPlay 找到匹配比赛但无法获取详情: {', '.join(candidate_ids[:3])}"
+    if len(candidate_ids) > 2:
+        output += f"\n... 还有 {len(candidate_ids) - 2} 场匹配，缩小搜索范围可获取更多"
+
     return output
 
 

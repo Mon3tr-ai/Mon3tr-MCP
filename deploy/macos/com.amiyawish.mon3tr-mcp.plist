@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS launchd 定义：等价于 Windows 的登录自启计划任务 / Linux 的 systemd --user。
+  安装（把 /Users/CHANGE_ME 换成你的家目录）：
+    sed "s#/Users/CHANGE_ME#$HOME#g" deploy/macos/com.amiyawish.mon3tr-mcp.plist \
+        > ~/Library/LaunchAgents/com.amiyawish.mon3tr-mcp.plist
+    launchctl load -w ~/Library/LaunchAgents/com.amiyawish.mon3tr-mcp.plist
+  卸载：
+    launchctl unload -w ~/Library/LaunchAgents/com.amiyawish.mon3tr-mcp.plist
+  注意：launchd 不展开 ~ 和 $HOME，这里必须是绝对路径（上面的 sed 就是为了这个）。
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.amiyawish.mon3tr-mcp</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/CHANGE_ME/Mon3tr-MCP/run.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/CHANGE_ME/Mon3tr-MCP</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/CHANGE_ME/Mon3tr-MCP/logs/mon3tr-console.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/CHANGE_ME/Mon3tr-MCP/logs/mon3tr-console.log</string>
+
+    <!-- 需要走代理抓网页时取消注释
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HTTP_PROXY</key>
+        <string>http://127.0.0.1:7890</string>
+        <key>HTTPS_PROXY</key>
+        <string>http://127.0.0.1:7890</string>
+    </dict>
+    -->
+</dict>
+</plist>

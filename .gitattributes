@@ -1,0 +1,9 @@
+# 换行符策略：shell / unit / plist 一律 LF
+# （Windows 上 clone/编辑后若变成 CRLF，Linux 上会报 bad interpreter: ^M，
+#  这条规则让 git 每次 checkout 都还原本来的 LF）
+*.sh      text eol=lf
+*.service text eol=lf
+*.plist   text eol=lf
+*.bat     text eol=crlf
+*.vbs     text eol=crlf
+.gitattributes text eol=lf

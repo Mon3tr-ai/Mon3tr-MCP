@@ -1,0 +1,18 @@
+[Unit]
+Description=Mon3tr-MCP (Streamable HTTP MCP server on 127.0.0.1:8000)
+Documentation=file://%h/Mon3tr-MCP/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 项目不在 ~/Mon3tr-MCP 时改这两行（%h = 当前用户家目录）
+WorkingDirectory=%h/Mon3tr-MCP
+ExecStart=%h/Mon3tr-MCP/run.sh
+# 解释器自动探测；要固定版本就取消注释（Termux/多 Python 环境常用）
+# Environment=PYTHON=/usr/bin/python3
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

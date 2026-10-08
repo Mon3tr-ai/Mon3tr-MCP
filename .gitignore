@@ -1,0 +1,5 @@
+__pycache__/
+logs/
+start-hidden.bat
+start-hidden.vbs
+stop-service.bat

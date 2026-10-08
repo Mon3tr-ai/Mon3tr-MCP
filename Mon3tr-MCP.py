@@ -3,7 +3,9 @@ Mon3tr-MCP — 明日方舟 MCP 工具集
 支持 Windows / macOS / Linux（含 Android Termux）
 
 工具列表:
-  搜索/抓取: bing_search · fetch_page · fetch_prts_wiki
+  搜索/抓取: bing_search · tinyfish_search · fetch_page · fetch_prts_wiki
+             tinyfish_search 走 TinyFish 托管搜索 API（免费 12000 次/天），
+             需在环境变量 TINYFISH_API_KEY 或项目目录 .env 里配置 Key
   游戏数据:  fetch_gamedata（按仓库相对路径从 GitHub 拉取，带缓存）
   地图解析:  parse_map · get_cell_info · get_map_legend
   敌人数据:  get_level_enemies · get_enemy_by_id
@@ -89,6 +91,134 @@ def bing_search(query: str, num: int = 10, domain: str = "cn.bing.com") -> str:
                 f"摘要：{snippet.get_text() if snippet else '无'}"
             )
     return "\n---\n".join(results) if results else "没有找到结果"
+
+
+# ── TinyFish 托管搜索 API ────────────────────────────────────────
+# 端点：GET {base}?query=... ，认证头 X-API-Key。
+# 免费额度 12000 次/天（限速 30 次/分、500 次/时）。
+_TINYFISH_BASE_URL = os.environ.get(
+    "TINYFISH_SEARCH_BASE_URL", "https://api.search.tinyfish.ai"
+)
+
+
+def _tinyfish_api_key() -> str:
+    """取 TinyFish API Key：环境变量 → 项目目录 .env → 项目目录 .tinyfish_key"""
+    key = (os.environ.get("TINYFISH_API_KEY") or "").strip()
+    if key:
+        return key
+    base = Path(__file__).resolve().parent
+    for name in (".env", ".tinyfish_key"):
+        path = base / name
+        try:
+            if not path.is_file():
+                continue
+            for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if name == ".tinyfish_key":
+                    return line
+                if line.split("=", 1)[0].strip().lstrip("export ").strip() == "TINYFISH_API_KEY":
+                    return line.split("=", 1)[1].strip().strip("'\"")
+        except OSError:
+            continue
+    return ""
+
+
+@mcp.tool()
+def tinyfish_search(
+    query: str,
+    num: int = 10,
+    domain_type: str = "",
+    recency_minutes: int = 0,
+    include_domains: str = "",
+    exclude_domains: str = "",
+    language: str = "",
+) -> str:
+    """
+    用 TinyFish 搜索网页，返回标题、链接、来源和摘要。
+
+    与 bing_search 的区别：结果由服务端检索排序、带 site_name，中英文都较稳，
+    并且支持按来源类型/域名/时间新鲜度过滤；缺点是需要 API Key
+    （环境变量 TINYFISH_API_KEY，或项目目录下 .env / .tinyfish_key 文件）。
+
+    参数:
+        query: 搜索关键词
+        num: 返回结果条数（1-10，服务端单页上限 10）
+        domain_type: 来源类型，留空=网页，"news"=新闻，"research_paper"=论文
+        recency_minutes: 只看最近 N 分钟内发布的结果（0=不限）
+        include_domains: 只在这些域名内搜索，逗号分隔，如 "github.com,docs.python.org"
+        exclude_domains: 排除这些域名，逗号分隔
+        language: 结果语言偏好，如 "zh" / "en"（留空由服务端判断）
+    """
+    key = _tinyfish_api_key()
+    if not key:
+        return (
+            "TinyFish 未配置 API Key：请设置环境变量 TINYFISH_API_KEY，"
+            f"或在 {Path(__file__).resolve().parent} 下新建 .env 写入 "
+            "TINYFISH_API_KEY=sk-tinyfish-..."
+        )
+
+    params: dict = {"query": query}
+    if domain_type in ("news", "research_paper"):
+        params["domain_type"] = domain_type
+    if recency_minutes and recency_minutes > 0:
+        params["recency_minutes"] = int(recency_minutes)
+    if include_domains.strip():
+        params["include_domains"] = include_domains.strip()
+    if exclude_domains.strip():
+        params["exclude_domains"] = exclude_domains.strip()
+    if language.strip():
+        params["language"] = language.strip()
+
+    try:
+        res = requests.get(
+            _TINYFISH_BASE_URL,
+            params=params,
+            headers={
+                "X-API-Key": key,
+                "Accept": "application/json",
+                "User-Agent": _MOBILE_UA,
+            },
+            timeout=20,
+        )
+    except Exception as e:
+        return f"TinyFish 请求失败：{e}"
+
+    if res.status_code in (401, 403):
+        return (
+            f"TinyFish 拒绝了这个 API Key（HTTP {res.status_code}）："
+            "请检查 TINYFISH_API_KEY 是否有效。"
+        )
+    if res.status_code == 429:
+        return "TinyFish 限流（HTTP 429）：免费额度为 30 次/分、500 次/时，请稍后再试。"
+    if res.status_code != 200:
+        return f"TinyFish 返回异常（HTTP {res.status_code}）：{res.text[:300]}"
+
+    try:
+        data = res.json()
+    except ValueError:
+        return f"TinyFish 返回了非 JSON 响应：{res.text[:300]}"
+
+    results = data.get("results") or []
+    if not results:
+        return "没有找到结果"
+
+    limit = num if 0 < num <= 10 else 10
+    blocks = []
+    for item in results[:limit]:
+        block = (
+            f"标题：{item.get('title') or '无标题'}\n"
+            f"链接：{item.get('url') or ''}\n"
+            f"来源：{item.get('site_name') or '未知'}"
+        )
+        if item.get("publisher"):
+            block += f"（{item['publisher']}）"
+        if item.get("date"):
+            block += f" · {item['date']}"
+        block += f"\n摘要：{item.get('snippet') or '无'}"
+        blocks.append(block)
+    return "\n---\n".join(blocks)
 
 
 @mcp.tool()
@@ -2414,251 +2544,1582 @@ def query_story(
 
 
 # ══════════════════════════════════════════════════════════════════
-# MAA 控制工具
+# MAA 自动化工具（maa-cli 后端）
 # ══════════════════════════════════════════════════════════════════
+#
+# 本节工具统一通过 maa-cli 驱动 MaaCore，取代旧的 ctypes 直连实现：
+#   · 跨平台：Windows / macOS / Linux 走同一套 maa-cli 命令
+#   · Python 侧不再加载 MaaCore 动态库，无需 ctypes
+#   · 复用 maa-cli 的 profile 配置、资源安装、日志与任务摘要
+#
+# maa-cli 定位顺序：工具参数 maa_path/maa_cli_path > 环境变量 MAA_CLI_PATH >
+# PATH 中的 maa-cli / maa > PATH 各目录下的同名无扩展名可执行文件。
 
-import ctypes
-import ctypes.util
-import platform
+import shutil
+import signal
+import subprocess
+import tempfile
 import threading
 import time
+import uuid
 
-_maa_lib = None
-_maa_instance = None
-_maa_connected = False
-_maa_log_buffer: list[str] = []
-_maa_log_lock = threading.Lock()
+from typing import Union
 
-# MAA 回调
-_CallBackType = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p)
+_MAA_CLI_ENV = "MAA_CLI_PATH"
+_MAA_CLI_NAMES = ("maa-cli.exe", "maa-cli", "maa.exe", "maa")
+import io
+import platform
+import tarfile
+import zipfile
+
+_MAA_CLI_ENV = "MAA_CLI_PATH"
+_MAA_CLI_VERSION_ENV = "MAA_CLI_VERSION"
+_MAA_CLI_NAMES = ("maa-cli.exe", "maa-cli", "maa.exe", "maa")
+
+# ── 首次运行自动下载 maa-cli ────────────────────────────────────
+# 官方发行资产命名：maa_cli-v{版本}-{target}.{ext}
+#   Windows → *-pc-windows-msvc.zip   （包内 maa.exe）
+#   macOS   → *-apple-darwin.tar.gz   （包内 maa）
+#   Linux   → *-unknown-linux-gnu.tar.gz（包内 maa）
+# 注意：官方不提供 Android/Termux 目标，该平台只能自行解决。
+_MAA_CLI_REPO = "MaaAssistantArknights/maa-cli"
+_MAA_CLI_RELEASE_API = "https://api.github.com/repos/%s/releases" % _MAA_CLI_REPO
+_MAA_CLI_DOWNLOAD_BASE = "https://github.com/%s/releases/download" % _MAA_CLI_REPO
+_MAA_CLI_CACHE = Path.home() / ".mon3tr-mcp" / "maa-cli"
+
+_MAA_CLI_TARGETS = {
+    ("windows", "x86_64"): ("x86_64-pc-windows-msvc", ".zip", "maa.exe"),
+    ("windows", "aarch64"): ("aarch64-pc-windows-msvc", ".zip", "maa.exe"),
+    ("darwin", "x86_64"): ("x86_64-apple-darwin", ".tar.gz", "maa"),
+    ("darwin", "aarch64"): ("aarch64-apple-darwin", ".tar.gz", "maa"),
+    ("linux", "x86_64"): ("x86_64-unknown-linux-gnu", ".tar.gz", "maa"),
+    ("linux", "aarch64"): ("aarch64-unknown-linux-gnu", ".tar.gz", "maa"),
+}
+
+_MAA_CLI_MISSING = (
+    "未找到 maa-cli 可执行文件，自动下载也未成功。可任选一种方式后重试：\n"
+    "  1. 确认能访问 GitHub 后重试（首次调用会自动下载到 ~/.mon3tr-mcp/maa-cli/）\n"
+    "  2. 手动安装：winget install MaaAssistantArknights.maa-cli\n"
+    "     或从 https://github.com/MaaAssistantArknights/maa-cli/releases 下载\n"
+    "  3. 调用工具时传入 maa_path，或设置环境变量 MAA_CLI_PATH 指向它\n"
+    "  4. Android/Termux 无官方预编译版本，MAA 相关工具在该平台不可用"
+)
+
+_maa_cli_path: Optional[str] = None
+_maa_cli_last_error: str = ""
+_maa_cli_lock = threading.Lock()
+_maa_cli_version_cache: dict = {}
 
 
-def _maa_callback(msg: int, detail: bytes, arg):
-    """MAA 回调函数，收集日志"""
+def _maa_cli_missing_message() -> str:
+    """组装「找不到 maa-cli」的报错，并附上自动下载失败原因。"""
+    if _maa_cli_last_error:
+        return _MAA_CLI_MISSING + "\n\n自动下载失败原因：" + _maa_cli_last_error
+    return _MAA_CLI_MISSING
+
+
+def _maa_cli_is_termux() -> bool:
+    """Termux 也报 linux，但官方没有 Android 目标，需单独识别。"""
+    if "com.termux" in os.environ.get("PREFIX", ""):
+        return True
+    return Path("/data/data/com.termux/files/usr").is_dir()
+
+
+def _maa_cli_platform():
+    """返回 (系统, 架构)，如 ("windows", "x86_64")。"""
+    if sys.platform == "win32":
+        system = "windows"
+    elif sys.platform == "darwin":
+        system = "darwin"
+    else:
+        system = "linux"
+    machine = platform.machine().lower()
+    if machine in ("amd64", "x86_64"):
+        arch = "x86_64"
+    elif machine in ("arm64", "aarch64"):
+        arch = "aarch64"
+    else:
+        arch = machine
+    return system, arch
+
+
+def _maa_cli_target():
+    """返回 (target 三元组, 扩展名, 包内可执行文件名)；平台不受支持时为 None。"""
+    return _MAA_CLI_TARGETS.get(_maa_cli_platform())
+
+
+def _maa_cli_parse_version(text: str):
+    """从 `maa 0.7.5` 之类的输出解析版本号，返回 (major, minor, patch)。"""
+    match = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", text or "")
+    if not match:
+        return ()
+    return tuple(int(part) for part in match.groups() if part is not None)
+
+
+def _maa_cli_version(exe) -> tuple:
+    """探测可执行文件版本；失败返回 ()。结果按路径缓存，避免重复拉起进程。"""
+    key = str(exe)
+    cached = _maa_cli_version_cache.get(key)
+    if cached is not None:
+        return cached
+    version = ()
     try:
-        detail_str = detail.decode("utf-8") if detail else ""
-        with _maa_log_lock:
-            _maa_log_buffer.append(f"[{msg}] {detail_str}")
-            if len(_maa_log_buffer) > 200:
-                _maa_log_buffer.pop(0)
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        proc = subprocess.run([key, "--version"], capture_output=True, timeout=30,
+                              creationflags=creationflags, check=False)
+        text = (proc.stdout or b"").decode("utf-8", "replace")
+        if not text.strip():
+            text = (proc.stderr or b"").decode("utf-8", "replace")
+        version = _maa_cli_parse_version(text)
     except Exception:
+        version = ()
+    _maa_cli_version_cache[key] = version
+    return version
+
+
+def _maa_cli_make_executable(path) -> None:
+    """Unix 平台补上可执行权限。"""
+    if os.name == "nt":
+        return
+    try:
+        path.chmod(path.stat().st_mode | 0o755)
+    except OSError:
         pass
 
 
-_callback_ref = _CallBackType(_maa_callback)
+def _maa_cli_auto_download():
+    """下载并解压 maa-cli。返回 (可执行路径, 说明)；失败返回 (None, 原因)。"""
+    if _maa_cli_is_termux():
+        return None, "Android/Termux 没有官方预编译版本"
 
+    target = _maa_cli_target()
+    if target is None:
+        return None, "当前平台 %s/%s 没有对应的 maa-cli 发行版" % _maa_cli_platform()
+    triple, ext, exe_name = target
 
-def _load_maa(maa_path: str) -> bool:
-    """加载 MaaCore.dll 并初始化资源"""
-    global _maa_lib
-    p = Path(maa_path)
-    dll_path = p / "MaaCore.dll"
-    if not dll_path.exists():
-        return False
+    version = os.environ.get(_MAA_CLI_VERSION_ENV, "").strip().lstrip("v")
+    url_api = ("%s/tags/v%s" % (_MAA_CLI_RELEASE_API, version)) if version \
+        else ("%s/latest" % _MAA_CLI_RELEASE_API)
 
-    # 把 MAA 目录加入 PATH
-    env_path = os.environ.get("PATH", "")
-    if str(p) not in env_path:
-        os.environ["PATH"] = str(p) + os.pathsep + env_path
-
-    _maa_lib = ctypes.WinDLL(str(dll_path))
-    _set_lib_properties()
-
-    # 加载资源
-    resource_path = p / "resource"
-    if resource_path.exists():
-        _maa_lib.AsstLoadResource(str(p).encode("utf-8"))
-    return True
-
-
-def _set_lib_properties():
-    """设置 ctypes 接口"""
-    _maa_lib.AsstSetUserDir.restype = ctypes.c_bool
-    _maa_lib.AsstSetUserDir.argtypes = (ctypes.c_char_p,)
-    _maa_lib.AsstLoadResource.restype = ctypes.c_bool
-    _maa_lib.AsstLoadResource.argtypes = (ctypes.c_char_p,)
-    _maa_lib.AsstCreate.restype = ctypes.c_void_p
-    _maa_lib.AsstCreate.argtypes = ()
-    _maa_lib.AsstCreateEx.restype = ctypes.c_void_p
-    _maa_lib.AsstCreateEx.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
-    _maa_lib.AsstDestroy.argtypes = (ctypes.c_void_p,)
-    _maa_lib.AsstConnect.restype = ctypes.c_bool
-    _maa_lib.AsstConnect.argtypes = (ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p)
-    _maa_lib.AsstAppendTask.restype = ctypes.c_int
-    _maa_lib.AsstAppendTask.argtypes = (ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p)
-    _maa_lib.AsstSetTaskParams.restype = ctypes.c_bool
-    _maa_lib.AsstSetTaskParams.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_char_p)
-    _maa_lib.AsstStart.restype = ctypes.c_bool
-    _maa_lib.AsstStart.argtypes = (ctypes.c_void_p,)
-    _maa_lib.AsstStop.restype = ctypes.c_bool
-    _maa_lib.AsstStop.argtypes = (ctypes.c_void_p,)
-    _maa_lib.AsstRunning.restype = ctypes.c_bool
-    _maa_lib.AsstRunning.argtypes = (ctypes.c_void_p,)
-    _maa_lib.AsstGetVersion.restype = ctypes.c_char_p
-
-
-@mcp.tool()
-def maa_connect(
-    maa_path: str,
-    adb_path: str = "",
-    address: str = "127.0.0.1:5555",
-    config: str = "General",
-) -> str:
-    """
-    连接 MAA 到模拟器/设备。首次调用时加载 MaaCore.dll。
-
-    参数:
-        maa_path:  MAA 安装目录（含 MaaCore.dll 和 resource/），如 "C:/MAA"
-        adb_path:  adb 路径，留空则使用 MAA 自带的 adb
-        address:   设备地址，如 "127.0.0.1:5555"（MuMu）、"127.0.0.1:7555"（雷电）
-        config:    连接配置，默认 "General"
-    """
-    global _maa_lib, _maa_instance, _maa_connected
-
+    expected_size, asset_name = None, ""
     try:
-        p = Path(maa_path)
-        if not _maa_lib:
-            if not _load_maa(maa_path):
-                return f"错误: 在 {maa_path} 未找到 MaaCore.dll"
+        resp = requests.get(url_api, timeout=30, headers={
+            "User-Agent": _MOBILE_UA, "Accept": "application/vnd.github+json"})
+        resp.raise_for_status()
+        info = resp.json()
+        version = str(info.get("tag_name", "")).lstrip("v")
+        asset_name = "maa_cli-v%s-%s%s" % (version, triple, ext)
+        for asset in info.get("assets", []):
+            if asset.get("name") == asset_name:
+                expected_size = asset.get("size")
+                break
+    except Exception as exc:
+        return None, "查询 maa-cli 版本失败（%s）" % str(exc)[:120]
 
-        # 创建实例
-        if _maa_instance:
-            _maa_lib.AsstStop(_maa_instance)
-            _maa_lib.AsstDestroy(_maa_instance)
-        _maa_instance = _maa_lib.AsstCreateEx(_callback_ref, None)
+    if not version:
+        return None, "无法确定 maa-cli 版本"
 
-        # 确定 adb 路径
-        if not adb_path:
-            for candidate in ["platform-tools/adb.exe", "adb.exe"]:
-                if (p / candidate).exists():
-                    adb_path = str(p / candidate)
-                    break
-            if not adb_path:
-                adb_path = "adb"
+    inst_dir = _MAA_CLI_CACHE / version
+    exe_path = inst_dir / exe_name
+    if exe_path.is_file():
+        _maa_cli_make_executable(exe_path)
+        return str(exe_path), "已存在缓存 v%s" % version
 
-        # 连接
-        ok = _maa_lib.AsstConnect(
-            _maa_instance,
-            adb_path.encode("utf-8"),
-            address.encode("utf-8"),
-            config.encode("utf-8"),
-        )
-        _maa_connected = bool(ok)
-
-        if _maa_connected:
-            ver = _maa_lib.AsstGetVersion().decode("utf-8")
-            return f"连接成功！MAA 版本: {ver}，设备: {address}"
-        else:
-            return f"连接失败。请检查: 1) adb路径是否正确 2) 模拟器是否运行 3) 地址是否正确"
-    except Exception as e:
-        return f"错误: {e}"
-
-
-@mcp.tool()
-def maa_start_task(
-    tasks: str,
-) -> str:
-    """
-    添加并启动 MAA 任务。可同时添加多个任务（按顺序执行）。
-
-    参数:
-        tasks:  任务配置，JSON 数组格式。每个元素: {"type": "任务类型", "params": {参数}}
-                支持的任务类型:
-                - StartUp: 开始唤醒，params: {"client_type": "Official"/"Bilibili", "start_game_enabled": true}
-                - Fight: 刷理智，params: {"stage": "1-7"/"CE-6"/"AP-5"/""(当前关), "times": 99, "medicine": 0}
-                - Recruit: 自动公招，params: {"refresh": true, "select": [4,5], "confirm": [3,4,5]}
-                - Infrast: 基建换班，params: {"facility": ["Mfg","Trade","Power","Control","Reception","Office","Dorm"]}
-                - Mall: 信用购物，params: {"shopping": true}
-                - Award: 领取奖励
-                - Roguelike: 肉鸽，params: {"theme": "Phantom"/"Mizuki"/"Sami"/"Sarkaz"}
-                - Copilot: 自动作业，params: {"filename": "作业JSON路径"}
-                - CloseDown: 关闭游戏
-    示例: [{"type":"StartUp","params":{"client_type":"Official"}},{"type":"Fight","params":{"stage":"1-7","times":5}}]
-    """
-    global _maa_instance, _maa_connected
-
-    if not _maa_instance or not _maa_connected:
-        return "错误: MAA 未连接，请先调用 maa_connect"
-
+    url = "%s/v%s/%s" % (_MAA_CLI_DOWNLOAD_BASE, version, asset_name)
     try:
-        # 先停止正在运行的任务
-        if _maa_lib.AsstRunning(_maa_instance):
-            _maa_lib.AsstStop(_maa_instance)
-            time.sleep(0.5)
+        resp = requests.get(url, timeout=600, headers={"User-Agent": _MOBILE_UA})
+        resp.raise_for_status()
+        data = resp.content
+    except Exception as exc:
+        return None, "下载 %s 失败（%s）" % (asset_name, str(exc)[:120])
 
-        task_list = json.loads(tasks)
-        if not isinstance(task_list, list):
-            task_list = [task_list]
+    if expected_size and len(data) != expected_size:
+        return None, "下载不完整：期望 %s 字节，实际 %s 字节" % (expected_size, len(data))
 
-        added = []
-        for t in task_list:
-            task_type = t.get("type", "")
-            params = t.get("params", {})
-            task_id = _maa_lib.AsstAppendTask(
-                _maa_instance,
-                task_type.encode("utf-8"),
-                json.dumps(params, ensure_ascii=False).encode("utf-8"),
-            )
-            added.append(f"{task_type}(id={task_id})")
-
-        ok = _maa_lib.AsstStart(_maa_instance)
-        if ok:
-            return f"已启动 {len(added)} 个任务: {', '.join(added)}"
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    tmp_exe = exe_path.with_name(exe_name + ".part")
+    try:
+        if ext == ".zip":
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                member = next((n for n in archive.namelist()
+                               if Path(n).name == exe_name), None)
+                if member is None:
+                    return None, "压缩包里找不到 %s" % exe_name
+                with archive.open(member) as handle, open(tmp_exe, "wb") as out:
+                    shutil.copyfileobj(handle, out)
         else:
-            return "任务启动失败"
-    except json.JSONDecodeError as e:
-        return f"JSON 解析错误: {e}"
-    except Exception as e:
-        return f"错误: {e}"
-
-
-@mcp.tool()
-def maa_stop() -> str:
-    """停止当前所有 MAA 任务。"""
-    global _maa_instance
-    if not _maa_instance:
-        return "MAA 未初始化"
-    _maa_lib.AsstStop(_maa_instance)
-    return "已停止所有任务"
-
-
-@mcp.tool()
-def maa_status() -> str:
-    """查询 MAA 当前状态和最近日志。"""
-    global _maa_instance, _maa_connected
-    if not _maa_instance:
-        return "MAA 未初始化，请先调用 maa_connect"
-
-    running = bool(_maa_lib.AsstRunning(_maa_instance))
-    status = "运行中" if running else "空闲"
-
-    with _maa_log_lock:
-        recent_logs = _maa_log_buffer[-20:]
-
-    # 解析日志提取关键信息
-    info_lines = []
-    for log in recent_logs:
+            with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
+                member = next((m for m in archive.getmembers()
+                               if Path(m.name).name == exe_name), None)
+                if member is None:
+                    return None, "压缩包里找不到 %s" % exe_name
+                handle = archive.extractfile(member)
+                if handle is None:
+                    return None, "无法从压缩包读取 %s" % exe_name
+                with handle, open(tmp_exe, "wb") as out:
+                    shutil.copyfileobj(handle, out)
+    except Exception as exc:
         try:
-            # 日志格式: [msg_id] json_detail
-            detail = log.split("] ", 1)[1] if "] " in log else log
-            d = json.loads(detail)
-            if "what" in d:
-                info_lines.append(d.get("what", "") + ": " + d.get("details", {}).get("task", d.get("why", "")))
-            elif "details" in d and isinstance(d["details"], dict):
-                sub = d["details"]
-                if "task" in sub:
-                    info_lines.append(sub["task"])
-        except (json.JSONDecodeError, KeyError, TypeError):
-            if len(log) < 200:
-                info_lines.append(log)
+            tmp_exe.unlink()
+        except OSError:
+            pass
+        return None, "解压失败（%s）" % str(exc)[:120]
 
-    result = f"状态: {status}\n连接: {'已连接' if _maa_connected else '未连接'}\n"
-    if info_lines:
-        result += "\n最近日志:\n" + "\n".join(info_lines[-10:])
-    return result
+    tmp_exe.replace(exe_path)
+    _maa_cli_make_executable(exe_path)
+    return str(exe_path), "已下载 v%s" % version
 
+
+def _maa_cli_find(explicit: str = "", refresh: bool = False,
+                  auto_download: bool = True) -> Optional[str]:
+    """定位 maa-cli 可执行文件；找不到返回 None。
+
+    优先级：
+      explicit 参数（可执行文件 / 所在目录 / MAA 安装目录）
+      > 环境变量 MAA_CLI_PATH
+      > 「自动下载缓存 + PATH」全部候选中**版本最高**者
+      > 一个都没有时自动下载对应平台版本
+
+    版本优选是必要的：本机可能同时存在多份 maa-cli（实测 PATH 第 16 位是旧的
+    0.5.9、第 39 位才是 0.6.0），早期「命中即用」的实现会静默选中旧版本。
+    """
+    global _maa_cli_path, _maa_cli_last_error
+
+    def match_dir(directory):
+        hits = []
+        for name in _MAA_CLI_NAMES:
+            candidate = Path(directory) / name
+            if candidate.is_file():
+                hits.append(str(candidate))
+        return hits
+
+    if explicit:
+        path = Path(explicit)
+        if path.is_file():
+            _maa_cli_path = str(path)
+            return _maa_cli_path
+        if path.is_dir():
+            hits = match_dir(explicit)
+            if hits:
+                _maa_cli_path = hits[0]
+                return _maa_cli_path
+        found = shutil.which(explicit)
+        if found:
+            _maa_cli_path = found
+            return found
+
+    with _maa_cli_lock:
+        if _maa_cli_path and not refresh and Path(_maa_cli_path).is_file():
+            return _maa_cli_path
+
+        # 1) 环境变量 MAA_CLI_PATH：用户显式指定，直接采用
+        env_value = os.environ.get(_MAA_CLI_ENV, "").strip().strip('"')
+        if env_value:
+            found = match_dir(env_value) if Path(env_value).is_dir() else []
+            if not found and Path(env_value).is_file():
+                found = [env_value]
+            if not found:
+                which = shutil.which(env_value)
+                found = [which] if which else []
+            if found:
+                _maa_cli_path = found[0]
+                return _maa_cli_path
+
+        # 2) 收集候选：自动下载缓存 + PATH。
+        #    shutil.which 在 Windows 上不会命中无扩展名的可执行文件，故再扫一遍目录。
+        candidates = []
+        if _MAA_CLI_CACHE.is_dir():
+            for inst in sorted(_MAA_CLI_CACHE.iterdir(), reverse=True):
+                if inst.is_dir():
+                    candidates.extend(match_dir(inst))
+        for name in _MAA_CLI_NAMES:
+            which = shutil.which(name)
+            if which:
+                candidates.append(which)
+        for directory in os.environ.get("PATH", "").split(os.pathsep):
+            if directory.strip():
+                candidates.extend(match_dir(directory))
+
+        unique, seen = [], set()
+        for candidate in candidates:
+            try:
+                key = str(Path(candidate).resolve()).lower()
+            except OSError:
+                key = candidate.lower()
+            if key not in seen:
+                seen.add(key)
+                unique.append(candidate)
+
+        if unique:
+            if len(unique) == 1:
+                best = unique[0]
+            else:
+                best = max(unique, key=lambda item: (_maa_cli_version(item), item))
+            _maa_cli_path = best
+            return best
+
+        # 3) 一个候选都没有 → 自动下载
+        if auto_download:
+            exe, message = _maa_cli_auto_download()
+            if exe:
+                _maa_cli_last_error = ""
+                _maa_cli_path = exe
+                return exe
+            _maa_cli_last_error = message
+
+    return None
+
+
+# ── 命令执行 ────────────────────────────────────────────────────
+
+def _maa_run_dir() -> Path:
+    """存放任务文件、作业输出与日志的临时目录。"""
+    directory = Path(tempfile.gettempdir()) / "mon3tr-mcp-maa"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def _maa_creationflags() -> int:
+    if os.name != "nt":
+        return 0
+    return getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def _maa_decode(data) -> str:
+    """解码子进程输出：优先 UTF-8，退回 Windows 中文环境常用的 GBK。"""
+    if not data:
+        return ""
+    for codec in ("utf-8", "gbk"):
+        try:
+            return data.decode(codec)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", "replace")
+
+
+def _maa_cli_exec(args, timeout: int = 600, log_file=None, exe: str = ""):
+    """同步执行 maa-cli，返回 dict(ok, code, out, err, cmd)。"""
+    binary = _maa_cli_find(exe)
+    if not binary:
+        return {"ok": False, "code": None, "out": "", "err": _maa_cli_missing_message(), "cmd": ""}
+
+    cmd = [binary, "--batch"]
+    if log_file:
+        cmd.append(f"--log-file={log_file}")
+    cmd.extend(str(a) for a in args)
+
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=timeout,
+            env=env,
+            creationflags=_maa_creationflags(),
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "ok": False, "code": None, "out": "", "cmd": " ".join(cmd),
+            "err": f"命令超过 {timeout} 秒仍未结束，已放弃等待。\n"
+                   "长时间任务请改用 maacli_job_start，再用 maacli_job_status 查看进度。",
+        }
+    except OSError as exc:
+        return {"ok": False, "code": None, "out": "", "cmd": " ".join(cmd),
+                "err": f"执行 maa-cli 失败：{exc}"}
+
+    out = _maa_decode(proc.stdout).strip()
+    err = _maa_decode(proc.stderr).strip()
+    return {"ok": proc.returncode == 0, "code": proc.returncode,
+            "out": out, "err": err, "cmd": " ".join(cmd)}
+
+
+def _maa_cli_report(res, title: str = "", limit: int = 4000) -> str:
+    """把 _maa_cli_exec 的结果格式化成给模型看的文本。"""
+    lines = []
+    if title:
+        lines.append(title)
+    if res.get("cmd"):
+        lines.append(f"$ {res['cmd']}")
+
+    out = res.get("out") or ""
+    err = res.get("err") or ""
+
+    if res.get("ok"):
+        if out:
+            if len(out) > limit:
+                out = out[:limit] + f"\n…（输出已截断，完整输出共 {len(res['out'])} 字符）"
+            lines.append(out)
+        if err:
+            if out:
+                lines.append(f"[stderr]\n{err[:limit]}")
+            else:
+                lines.append(err[:limit])
+        if not out and not err:
+            lines.append("命令执行成功（无输出）")
+    else:
+        detail = err or out or "命令执行失败，且没有任何输出"
+        if len(detail) > limit:
+            detail = detail[:limit] + "…（已截断）"
+        lines.append(f"命令执行失败（退出码 {res.get('code')}）：\n{detail}")
+
+    return "\n".join(lines)
+
+
+# ── 参数与状态辅助 ──────────────────────────────────────────────
+
+def _maa_split_args(text: str):
+    """把字符串切成参数列表。
+
+    支持 JSON 数组形式 '["fight", "1-7"]'，或空格分隔形式（含空格的片段用双引号
+    或单引号包裹）。后者刻意不依赖 shlex，以免 Windows 路径中的反斜杠被吞掉。
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    if text[0] in "[{":
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            pass
+        else:
+            if isinstance(data, list):
+                return [str(item) for item in data]
+
+    out: list[str] = []
+    buf: list[str] = []
+    quote = None
+    for char in text:
+        if quote:
+            if char == quote:
+                quote = None
+            else:
+                buf.append(char)
+        elif char in "\"'":
+            quote = char
+        elif char.isspace():
+            if buf:
+                out.append("".join(buf))
+                buf = []
+        else:
+            buf.append(char)
+    if buf:
+        out.append("".join(buf))
+    return out
+
+
+def _maa_argv(value) -> list:
+    """把工具入参规范成参数列表：既接受字符串（JSON 数组 / 空格分隔），也接受数组。"""
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value]
+    return _maa_split_args(str(value or ""))
+
+
+def _maa_split_list(text: str):
+    """把逗号 / 空白分隔的多个值切成列表（用于 uri、drops 等可重复参数）。"""
+    if not text:
+        return []
+    normalized = text.replace(",", " ").replace("，", " ").replace("\n", " ")
+    return [item for item in normalized.split() if item]
+
+
+def _maa_conn_args(addr: str = "", profile: str = "") -> list:
+    args: list[str] = []
+    if addr and addr.strip():
+        args += ["--addr", addr.strip()]
+    if profile and profile.strip():
+        args += ["--profile", profile.strip()]
+    return args
+
+
+# 会话级状态：连接参数 + 后台作业表
+_maa_session = {
+    "address": "",
+    "profile": "",
+    "adb_path": "",
+    "maa_cli": "",
+    "core_version": "",
+    "connected": False,
+}
+
+_maa_jobs: dict = {}
+_maa_jobs_lock = threading.Lock()
+_MAA_JOB_KEEP = 20
+
+
+def _maa_tail(path, max_chars: int = 2000, max_bytes: int = 200000) -> str:
+    """读取文件尾部内容（按字节截断，避免大日志拖慢响应）。"""
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return ""
+    if len(data) > max_bytes:
+        data = data[-max_bytes:]
+    text = data.decode("utf-8", "replace").strip()
+    if len(text) > max_chars:
+        text = "…" + text[-max_chars:]
+    return text
+
+
+def _maa_job_find(job_id: str = ""):
+    """按 id 找作业；job_id 为空时返回最近一个作业。"""
+    with _maa_jobs_lock:
+        if job_id:
+            for job in _maa_jobs.values():
+                if job["id"] == job_id or job["id"].endswith(job_id):
+                    return job
+            return None
+        if not _maa_jobs:
+            return None
+        return max(_maa_jobs.values(), key=lambda job: job["started"])
+
+
+def _maa_job_running(job) -> bool:
+    return job["proc"].poll() is None
+
+
+def _maa_job_describe(job, with_output: bool = True) -> str:
+    """生成单个作业的状态描述。"""
+    code = job["proc"].poll()
+    elapsed = int(time.time() - job["started"])
+    minutes, seconds = divmod(elapsed, 60)
+
+    if code is None:
+        state = "运行中"
+    elif code == 0:
+        state = "已完成"
+    else:
+        state = f"已结束（退出码 {code}）"
+
+    lines = [
+        f"作业 {job['id']}",
+        f"  状态: {state}",
+        f"  任务: {job['label']}",
+        f"  命令: {job['cmd']}",
+        f"  已运行: {minutes} 分 {seconds} 秒",
+        f"  输出目录: {job['dir']}",
+    ]
+
+    if with_output:
+        output = _maa_tail(job["out_file"])
+        lines.append(f"  最近输出:\n{output}" if output else "  最近输出:（暂无）")
+        log_tail = _maa_tail(job["log_file"], max_chars=800)
+        if log_tail:
+            lines.append(f"  maa-cli 日志尾部:\n{log_tail}")
+
+    if code is None:
+        lines.append(f"  提示: 用 maacli_job_stop(\"{job['id']}\") 可停止该作业")
+    return "\n".join(lines)
+
+
+def _maa_job_prune() -> None:
+    """只保留最近 _MAA_JOB_KEEP 个作业记录，超出的关闭文件句柄并移除。"""
+    with _maa_jobs_lock:
+        if len(_maa_jobs) <= _MAA_JOB_KEEP:
+            return
+        ordered = sorted(_maa_jobs.values(), key=lambda job: job["started"])
+        for job in ordered[:-_MAA_JOB_KEEP]:
+            if _maa_job_running(job):
+                continue
+            try:
+                job["handle"].close()
+            except Exception:
+                pass
+            _maa_jobs.pop(job["id"], None)
+
+
+def _maa_job_start(args, label: str = "", exe: str = ""):
+    """后台启动一条 maa-cli 命令，返回 dict(ok, job|err)。"""
+    binary = _maa_cli_find(exe)
+    if not binary:
+        return {"ok": False, "err": _maa_cli_missing_message()}
+
+    args = [str(a) for a in args]
+    job_id = "maa-" + time.strftime("%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4]
+    workdir = _maa_run_dir() / "jobs" / job_id
+    workdir.mkdir(parents=True, exist_ok=True)
+    log_file = workdir / "maa-cli.log"
+    out_file = workdir / "output.log"
+
+    cmd = [binary, "--batch", f"--log-file={log_file}"] + args
+
+    creationflags = _maa_creationflags()
+    if os.name == "nt":
+        # 独立进程组，便于用 CTRL_BREAK 让 maa-cli 优雅停止任务
+        creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
+    handle = open(out_file, "wb")
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            creationflags=creationflags,
+        )
+    except OSError as exc:
+        handle.close()
+        return {"ok": False, "err": f"启动 maa-cli 失败：{exc}"}
+
+    job = {
+        "id": job_id,
+        "label": label.strip() or " ".join(args),
+        "args": args,
+        "cmd": " ".join(cmd),
+        "proc": proc,
+        "handle": handle,
+        "out_file": out_file,
+        "log_file": log_file,
+        "started": time.time(),
+        "dir": str(workdir),
+    }
+    with _maa_jobs_lock:
+        _maa_jobs[job_id] = job
+    _maa_job_prune()
+    return {"ok": True, "job": job}
+
+
+def _maa_job_stop(job) -> str:
+    """停止一个作业（先尝试优雅停止，再强制终止）。"""
+    if not _maa_job_running(job):
+        return f"作业 {job['id']} 已经结束，无需停止。"
+
+    proc = job["proc"]
+    graceful = False
+    if os.name == "nt":
+        try:
+            proc.send_signal(signal.CTRL_BREAK_EVENT)
+            graceful = True
+        except Exception:
+            graceful = False
+    else:
+        try:
+            proc.terminate()
+            graceful = True
+        except Exception:
+            graceful = False
+
+    if graceful:
+        try:
+            proc.wait(timeout=15)
+            return f"已停止作业 {job['id']}（退出码 {proc.returncode}）。"
+        except subprocess.TimeoutExpired:
+            pass
+
+    try:
+        proc.kill()
+        proc.wait(timeout=10)
+    except Exception:
+        pass
+
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                           capture_output=True, check=False)
+        except Exception:
+            pass
+
+    return f"已强制终止作业 {job['id']}（MAA 任务可能停在中间状态）。"
+
+
+def _maa_dispatch(args, label: str = "", background: bool = False,
+                  timeout: int = 600, exe: str = "") -> str:
+    """统一的「同步执行 or 后台运行」入口。"""
+    args = [str(a) for a in args]
+    if not args:
+        return "错误：没有给出 maa-cli 子命令。"
+
+    if background:
+        result = _maa_job_start(args, label=label, exe=exe)
+        if not result.get("ok"):
+            return result["err"]
+        job = result["job"]
+        return (
+            f"已在后台启动：{job['label']}\n"
+            f"作业 id: {job['id']}\n"
+            f"命令: {job['cmd']}\n"
+            f"用 maacli_job_status(\"{job['id']}\") 查看进度与输出，"
+            f"maacli_job_stop(\"{job['id']}\") 停止。"
+        )
+
+    result = _maa_cli_exec(args, timeout=timeout,
+                           log_file=_maa_run_dir() / "last-run.log", exe=exe)
+    return _maa_cli_report(result)
+
+
+# ── maa-cli 命令封装（maacli_*） ────────────────────────────────
+#
+# 同步执行类工具适合秒级~分钟级命令；fight / copilot / roguelike 等长任务
+# 建议用 background=True，或用 maacli_job_start 后台运行后轮询状态。
+
+@mcp.tool()
+def maacli_help(command: str = "") -> str:
+    """查询 maa-cli 的帮助与参数说明。
+
+    不确定某个子命令有哪些参数时，先用本工具查（例如 maacli_help("roguelike")），
+    再用 maacli_run / maacli_job_start 执行。
+
+    参数:
+        command: maa-cli 子命令名，如 "fight"、"copilot"、"roguelike"、"run"。
+                 留空则返回顶层命令列表。
+    """
+    args = [command.strip(), "--help"] if command.strip() else ["--help"]
+    return _maa_cli_report(_maa_cli_exec(args, timeout=60))
+
+
+@mcp.tool()
+def maacli_version(component: str = "all") -> str:
+    """查看 maa-cli 与 MaaCore 的版本。
+
+    参数:
+        component: "all"（默认）| "maa-cli" | "maa-core"
+    """
+    return _maa_cli_report(_maa_cli_exec(["version", component.strip() or "all"], timeout=60))
+
+
+@mcp.tool()
+def maacli_dir(dir_name: str = "config") -> str:
+    """打印 maa-cli / MaaCore 的各类目录路径。
+
+    参数:
+        dir_name: data | library | config | cache | resource | hot-update | log
+                  （config 目录下有 tasks/ 与 profiles/ 子目录）
+    """
+    return _maa_cli_report(_maa_cli_exec(["dir", dir_name.strip() or "config"], timeout=60))
+
+
+@mcp.tool()
+def maacli_list() -> str:
+    """列出 maa-cli 配置目录中所有可用的自定义任务（可用 maacli_run 运行）。"""
+    return _maa_cli_report(_maa_cli_exec(["list"], timeout=60))
+
+
+@mcp.tool()
+def maacli_install(channel: str = "", no_resource: bool = False, force: bool = False,
+                   background: bool = False, timeout: int = 1800) -> str:
+    """安装 MaaCore 与资源（首次使用 maa-cli 时通常需要执行一次）。
+
+    参数:
+        channel:  更新通道，留空为稳定版，也可传 "beta" / "alpha" / "nightly"
+        no_resource: 只装 MaaCore，不装资源
+        force:    即使已安装也强制重装
+        background: True 时后台执行（下载耗时较长，推荐）
+        timeout:  同步执行时的等待上限（秒），默认 1800
+    """
+    args = ["install"]
+    if channel.strip():
+        args.append(channel.strip())
+    if no_resource:
+        args.append("--no-resource")
+    if force:
+        args.append("--force")
+    return _maa_dispatch(args, label="install MaaCore/资源", background=background, timeout=timeout)
+
+
+@mcp.tool()
+def maacli_update(background: bool = False, timeout: int = 1800) -> str:
+    """更新 MaaCore 与资源到最新版本。
+
+    参数:
+        background: True 时后台执行（下载耗时较长，推荐）
+        timeout:  同步执行时的等待上限（秒），默认 1800
+    """
+    return _maa_dispatch(["update"], label="update MaaCore/资源",
+                         background=background, timeout=timeout)
+
+
+@mcp.tool()
+def maacli_hot_update(background: bool = True, timeout: int = 1800) -> str:
+    """热更新资源（从 MaaResource 仓库拉取，仅更新可热更的部分）。
+
+    参数:
+        background: True（默认）时后台执行
+        timeout:  同步执行时的等待上限（秒）
+    """
+    return _maa_dispatch(["hot-update"], label="hot-update 资源",
+                         background=background, timeout=timeout)
+
+
+@mcp.tool()
+def maacli_activity(client: str = "Official") -> str:
+    """显示指定客户端的关卡开放情况（哪些关卡在活动期间、理智消耗等）。
+
+    参数:
+        client: Official | Bilibili | Txwy | YoStarEN | YoStarJP | YoStarKR
+    """
+    return _maa_cli_report(_maa_cli_exec(["activity", client.strip() or "Official"], timeout=60))
+
+
+@mcp.tool()
+def maacli_remainder(divisor: int, timezone: Optional[int] = None) -> str:
+    """计算「当前日期除以给定数字」的余数（用于任务条件里的 remainder 字段）。
+
+    参数:
+        divisor:  除数
+        timezone: 时区偏移，如 8 表示 UTC+8；留空按本地时区
+    """
+    args = ["remainder", str(int(divisor))]
+    if timezone is not None:
+        args += ["--timezone", str(int(timezone))]
+    return _maa_cli_report(_maa_cli_exec(args, timeout=60))
+
+
+@mcp.tool()
+def maacli_convert(input: str, output: str = "", format: str = "") -> str:
+    """在 TOML / YAML / JSON 之间转换文件格式。
+
+    MaaCore 只接受 JSON，若手写的作业或基建配置是 TOML/YAML，可用本工具转换。
+
+    参数:
+        input:  输入文件路径
+        output: 输出文件路径；留空则直接返回转换结果
+        format: 输出格式 json | yaml | toml；留空按输出文件扩展名推断，无输出文件则默认 json
+    """
+    args = ["convert", input.strip()]
+    if output.strip():
+        args.append(output.strip())
+    if format.strip():
+        args += ["--format", format.strip()]
+    return _maa_cli_report(_maa_cli_exec(args, timeout=60))
+
+
+@mcp.tool()
+def maacli_import(path: str, name: str = "", config_type: str = "task", force: bool = False) -> str:
+    """把配置文件导入 maa-cli 的配置目录（支持本地路径与 HTTP(S) URL）。
+
+    参数:
+        path:        文件路径或 URL
+        name:        导入后的文件名（不含扩展名），留空用原名
+        config_type: task（自定义任务）| cli | asst/profile（MaaCore 配置）|
+                     infrast（基建排班）| copilot | ssscopilot | resource
+        force:       同名文件已存在时覆盖
+    """
+    args = ["import", path.strip()]
+    if name.strip():
+        args += ["--name", name.strip()]
+    if config_type.strip():
+        args += ["--config-type", config_type.strip()]
+    if force:
+        args.append("--force")
+    return _maa_cli_report(_maa_cli_exec(args, timeout=120))
+
+
+@mcp.tool()
+def maacli_init(name: str = "", format: str = "", force: bool = False) -> str:
+    """初始化 maa-cli 配置（生成 profile 模板，之后可用 maa_connect 之前先做这一步）。
+
+    参数:
+        name:   profile 名，留空则初始化默认 profile
+        format: json（默认）| yaml | toml
+        force:  profile 已存在时覆盖
+    """
+    args = ["init"]
+    if name.strip():
+        args += ["--name", name.strip()]
+    if format.strip():
+        args += ["--format", format.strip()]
+    if force:
+        args.append("--force")
+    return _maa_cli_report(_maa_cli_exec(args, timeout=120))
+
+
+@mcp.tool()
+def maacli_cleanup(targets: str = "") -> str:
+    """清理 maa-cli / MaaCore 的缓存与日志。
+
+    参数:
+        targets: 逗号或空格分隔，可选 cli-cache | core-cache | debug | log；
+                 留空则清理全部可清理项
+    """
+    args = ["cleanup"] + _maa_split_list(targets)
+    return _maa_cli_report(_maa_cli_exec(args, timeout=120))
+
+
+@mcp.tool()
+def maacli_fight(stage: str = "", medicine: int = 0, expiring_medicine: int = 0,
+                 stone: int = 0, times: int = 0, drops: str = "", series: int = 1,
+                 addr: str = "", profile: str = "",
+                 background: bool = False, timeout: int = 900) -> str:
+    """刷理智（战斗）。长时间运行，建议 background=True。
+
+    参数:
+        stage:   关卡号，如 "1-7"、"CE-6"、"AP-5"；留空则打当前/上次关卡
+        medicine: 最多吃多少瓶理智药（默认 0）
+        expiring_medicine: 最多吃多少瓶将过期理智药
+        stone:   最多碎多少颗源石（默认 0）
+        times:   打多少次后退出（默认不限）
+        drops:   掉落物达到指定数量后退出，格式 "物品ID=数量"，
+                 多个用逗号分隔，如 "30012=100,30011=100"
+        series:  单次代理次数 -1~6（-1 不切换，0 自动最大，默认 1）
+        addr:    设备地址，留空用 maa_connect 记录的地址
+        profile: maa-cli profile 名
+        background: True 时后台运行（推荐），用 maacli_job_status 查看进度
+        timeout: 同步执行时的等待上限（秒）
+    """
+    args = ["fight"]
+    if stage.strip():
+        args.append(stage.strip())
+    if medicine:
+        args += ["--medicine", str(int(medicine))]
+    if expiring_medicine:
+        args += ["--expiring-medicine", str(int(expiring_medicine))]
+    if stone:
+        args += ["--stone", str(int(stone))]
+    if times:
+        args += ["--times", str(int(times))]
+    for drop in _maa_split_list(drops):
+        args += ["--drops", drop]
+    if series != 1:
+        args += ["--series", str(int(series))]
+    args += _maa_conn_args(addr or _maa_session["address"], profile or _maa_session["profile"])
+    return _maa_dispatch(args, label=f"fight {stage or '当前关卡'}",
+                         background=background, timeout=timeout)
+
+
+@mcp.tool()
+def maacli_copilot(uris: str, raid: int = 0, formation: bool = False,
+                   use_sanity_potion: bool = False,
+                   addr: str = "", profile: str = "",
+                   background: bool = False, timeout: int = 1200) -> str:
+    """运行自动作业（copilot）——把生成的作业 JSON 直接交给 MAA 执行。
+
+    参数:
+        uris:    作业来源，多个用逗号或空格分隔。支持
+                 · 本地文件路径（如 "C:/作业/1-7.json"）
+                 · maa://<作业站编号>（如 "maa://12345"）
+                 · maa://<编号>s（作业集）
+        raid:    是否突袭 0 普通 / 1 突袭 / 2 普通+突袭各一次
+        formation: 是否自动编队（多作业或作业集时自动开启）
+        use_sanity_potion: 理智不足时是否自动吃药
+        addr:    设备地址，留空用 maa_connect 记录的地址
+        profile: maa-cli profile 名
+        background: True 时后台运行（推荐），用 maacli_job_status 查看进度
+        timeout: 同步执行时的等待上限（秒）
+    """
+    uri_list = _maa_split_list(uris)
+    if not uri_list:
+        return "错误：请提供至少一个作业来源（本地 JSON 路径或 maa:// 编号）。"
+    args = ["copilot"] + uri_list
+    if raid:
+        args += ["--raid", str(int(raid))]
+    if formation:
+        args.append("--formation")
+    if use_sanity_potion:
+        args.append("--use-sanity-potion")
+    args += _maa_conn_args(addr or _maa_session["address"], profile or _maa_session["profile"])
+    return _maa_dispatch(args, label=f"copilot {uri_list[0]}",
+                         background=background, timeout=timeout)
+
+
+@mcp.tool()
+def maacli_startup(client_type: str = "", account_name: str = "",
+                   addr: str = "", profile: str = "",
+                   background: bool = False, timeout: int = 600) -> str:
+    """启动游戏客户端并进入到主界面。
+
+    参数:
+        client_type: Official | Bilibili | Txwy | YoStarEN | YoStarJP | YoStarKR
+        account_name: 账号名（切换账号时使用）
+        addr:    设备地址，留空用 maa_connect 记录的地址
+        profile: maa-cli profile 名
+        background: True 时后台运行
+        timeout: 同步执行时的等待上限（秒）
+    """
+    args = ["startup"]
+    if client_type.strip():
+        args.append(client_type.strip())
+    if account_name.strip():
+        args += ["--account-name", account_name.strip()]
+    args += _maa_conn_args(addr or _maa_session["address"], profile or _maa_session["profile"])
+    return _maa_dispatch(args, label="startup 开始唤醒", background=background, timeout=timeout)
+
+
+@mcp.tool()
+def maacli_closedown(client: str = "Official", addr: str = "", profile: str = "",
+                    background: bool = False, timeout: int = 300) -> str:
+    """关闭游戏客户端（在游戏内退出账号，而不是杀进程）。
+
+    参数:
+        client: Official | Bilibili | Txwy | YoStarEN | YoStarJP | YoStarKR
+        addr:   设备地址，留空用 maa_connect 记录的地址
+        profile: maa-cli profile 名
+        background: True 时后台运行
+        timeout: 同步执行时的等待上限（秒）
+    """
+    args = ["closedown", client.strip() or "Official"]
+    args += _maa_conn_args(addr or _maa_session["address"], profile or _maa_session["profile"])
+    return _maa_dispatch(args, label="closedown 关闭游戏", background=background, timeout=timeout)
+
+
+@mcp.tool()
+def maacli_run(args: Union[str, list], label: str = "", addr: str = "", profile: str = "",
+               background: bool = False, timeout: int = 600) -> str:
+    """运行任意 maa-cli 命令（通用入口，覆盖上面未单独封装的全部子命令）。
+
+    典型用法：先用 maacli_help("roguelike") 查参数，再
+    maacli_run('["roguelike", "--theme", "Sami"]') 或 maacli_run("roguelike --theme Sami")。
+
+    参数:
+        args:  maa-cli 子命令与参数。推荐 JSON 数组形式（对空格/反斜杠路径最安全），
+               也支持空格分隔字符串，含空格的参数用双引号包裹。
+               例：'["run", "my-task"]'、'["ssscopilot", "C:/作业/sss.json"]'
+        label: 作业显示名（留空自动取命令本身）
+        addr:  设备地址，追加 --addr（留空用 maa_connect 记录的地址）
+        profile: maa-cli profile 名，追加 --profile
+        background: True 时后台运行（长任务推荐）
+        timeout: 同步执行时的等待上限（秒）
+    """
+    argv = _maa_argv(args)
+    if not argv:
+        return "错误：args 为空。"
+    argv += _maa_conn_args(addr or _maa_session["address"], profile or _maa_session["profile"])
+    return _maa_dispatch(argv, label=label or " ".join(argv[:2]),
+                         background=background, timeout=timeout)
+
+
+@mcp.tool()
+def maacli_job_start(args: Union[str, list], label: str = "", addr: str = "", profile: str = "") -> str:
+    """在后台启动任意 maa-cli 命令，立即返回作业 id（适合 fight / copilot / roguelike 等长任务）。
+
+    参数:
+        args:  maa-cli 子命令与参数，推荐 JSON 数组：
+               '["fight", "1-7", "--times", "99"]'
+        label: 作业显示名
+        addr:  设备地址（覆盖 maa_connect 记录的地址）
+        profile: maa-cli profile 名
+    """
+    argv = _maa_argv(args)
+    if not argv:
+        return "错误：args 为空。"
+    argv += _maa_conn_args(addr or _maa_session["address"], profile or _maa_session["profile"])
+    return _maa_dispatch(argv, label=label, background=True)
+
+
+@mcp.tool()
+def maacli_job_status(job_id: str = "") -> str:
+    """查询后台作业的进度与输出（登录完成情况、任务摘要、maa-cli 日志尾部）。
+
+    参数:
+        job_id: 作业 id（maacli_job_start 返回值）；留空则查询最近启动的作业
+    """
+    job = _maa_job_find(job_id.strip())
+    if job is None:
+        if job_id.strip():
+            return f"没有找到作业 {job_id}。可用 maacli_job_list 查看全部作业。"
+        return "还没有启动过任何后台作业。"
+    return _maa_job_describe(job)
+
+
+@mcp.tool()
+def maacli_job_list() -> str:
+    """列出本次会话启动过的所有后台作业及其状态。"""
+    with _maa_jobs_lock:
+        jobs = sorted(_maa_jobs.values(), key=lambda job: job["started"], reverse=True)
+    if not jobs:
+        return "还没有启动过任何后台作业。"
+
+    lines = ["后台作业列表（新→旧）:"]
+    for job in jobs:
+        code = job["proc"].poll()
+        if code is None:
+            state = "运行中"
+        elif code == 0:
+            state = "已完成"
+        else:
+            state = f"退出码 {code}"
+        elapsed = int(time.time() - job["started"])
+        lines.append(f"  {job['id']}  [{state}]  {elapsed}s  {job['label']}")
+    lines.append('\n用 maacli_job_status("<id>") 查看详情，maacli_job_stop("<id>") 停止。')
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def maacli_job_stop(job_id: str = "") -> str:
+    """停止后台作业。
+
+    参数:
+        job_id: 作业 id；留空则停止所有正在运行的作业
+    """
+    if job_id.strip():
+        job = _maa_job_find(job_id.strip())
+        if job is None:
+            return f"没有找到作业 {job_id}。"
+        return _maa_job_stop(job)
+
+    with _maa_jobs_lock:
+        running = [job for job in _maa_jobs.values() if _maa_job_running(job)]
+    if not running:
+        return "当前没有正在运行的作业。"
+    return "\n".join(_maa_job_stop(job) for job in running)
+
+
+# ── 活动关卡查询（MaaRelease API） ──────────────────────────────
+#
+# 数据源：MaaRelease 的 StageActivityV2.json，MAA GUI 也是从这里拉取活动数据
+#   https://api.maa.plus/MaaAssistantArknights/api/gui/StageActivityV2.json
+#   （旧域名 ota.maa.plus 已停用，会返回 530）
+#
+# 用途：判断某个活动关卡（如 SR-7）是否还在开放期，避免把已关闭的活动关卡
+# 写进任务文件——那会让 MaaCore 导航失败并报 TaskChainError。
+
+from datetime import datetime, timedelta, timezone as _timezone
+
+_MAA_ACTIVITY_URL = (
+    "https://api.maa.plus/MaaAssistantArknights/api/gui/StageActivityV2.json"
+)
+_MAA_ACTIVITY_TTL = 3600
+_maa_activity_cache: dict = {"time": 0.0, "data": None}
+
+# 常驻关卡（任何时候都可刷），用于无活动时的兜底建议
+_MAA_PERMANENT_STAGES = [
+    ("1-7", "低理智刷固源岩/龙门币，适合消耗剩余理智"),
+    ("CE-6", "龙门币（钱本）"),
+    ("LS-6", "经验卡（经验本）"),
+    ("AP-5", "采购凭证"),
+    ("CA-5", "技能概要"),
+    ("Annihilation", "剿灭作战（每周合成玉上限）"),
+]
+
+
+def _maa_parse_time(text):
+    """解析 API 中的时间串，如 '2026/09/18 03:59:59'。"""
+    for fmt in ("%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(str(text).strip(), fmt)
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def _maa_activity_fetch(force: bool = False):
+    """拉取活动关卡数据，返回 (data, 数据源说明)；失败返回 (None, 错误说明)。"""
+    now = time.time()
+    if (not force and _maa_activity_cache["data"] is not None
+            and now - _maa_activity_cache["time"] < _MAA_ACTIVITY_TTL):
+        return _maa_activity_cache["data"], "内存缓存"
+
+    cache_file = _maa_run_dir() / "StageActivityV2.json"
+    note = ""
+    try:
+        # 本机 TLS 证书链不完整（schannel: SEC_E_UNTRUSTED_ROOT），
+        # 该接口为公开只读数据，故跳过证书校验。
+        import urllib3
+        urllib3.disable_warnings()
+        resp = requests.get(_MAA_ACTIVITY_URL, timeout=30, verify=False,
+                            headers={"User-Agent": _MOBILE_UA})
+        if resp.ok:
+            data = resp.json()
+            cache_file.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            _maa_activity_cache.update({"time": now, "data": data})
+            return data, "在线（api.maa.plus）"
+        note = f"HTTP {resp.status_code}"
+    except Exception as exc:
+        note = f"{type(exc).__name__}: {str(exc)[:120]}"
+
+    if cache_file.is_file():
+        try:
+            data = json.loads(cache_file.read_text(encoding="utf-8"))
+            _maa_activity_cache.update({"time": now, "data": data})
+            return data, f"本地缓存（在线获取失败：{note}）"
+        except Exception:
+            pass
+    return None, note
+
+
+def _maa_activity_state(activity: dict) -> str:
+    """判断活动状态，返回 (state, 窗口说明)；state 取值：open/pending/expired/unknown。"""
+    tz_hours = activity.get("TimeZone", 8)
+    try:
+        tz = _timezone(timedelta(hours=int(tz_hours)))
+    except (TypeError, ValueError):
+        tz = _timezone(timedelta(hours=8))
+    now_local = datetime.now(tz).replace(tzinfo=None)
+
+    start = _maa_parse_time(activity.get("UtcStartTime"))
+    expire = _maa_parse_time(activity.get("UtcExpireTime"))
+
+    window = "%s → %s（UTC+%s）" % (
+        activity.get("UtcStartTime", "?"), activity.get("UtcExpireTime", "?"), tz_hours)
+
+    if start is None or expire is None:
+        return "unknown", window + "（时间字段无法解析）"
+    if expire < start:
+        # API 偶发的时间区间异常，不做误判
+        return "unknown", window + "（时间区间异常）"
+    if now_local < start:
+        left = start - now_local
+        return "pending", "%s（%s 后开始）" % (window, _maa_human_delta(left))
+    if now_local > expire:
+        over = now_local - expire
+        return "expired", "%s（%s 前已结束）" % (window, _maa_human_delta(over))
+    left = expire - now_local
+    return "open", "%s（剩余 %s）" % (window, _maa_human_delta(left))
+
+
+def _maa_human_delta(delta) -> str:
+    total = int(delta.total_seconds())
+    if total < 0:
+        total = -total
+    days, rest = divmod(total, 86400)
+    hours, rest = divmod(rest, 3600)
+    if days:
+        return "%d 天 %d 小时" % (days, hours)
+    if hours:
+        return "%d 小时 %d 分" % (hours, rest // 60)
+    return "%d 分" % max(1, rest // 60)
+
+
+@mcp.tool()
+def maa_open_stages(client: str = "Official", include_expired: bool = False,
+                    force_refresh: bool = False) -> str:
+    """查询「当前开放的活动关卡」及开放时间，用于判断某个活动关卡还能不能刷。
+
+    活动关卡（如 SR-7）只在活动期内开放。活动结束后把该关卡写进任务文件，
+    MaaCore 会导航失败并报 TaskChainError，所以配置任务前先用本工具确认。
+
+    参数:
+        client:         游戏客户端：Official（官服，默认）| Bilibili | Txwy |
+                        YoStarEN | YoStarJP | YoStarKR
+        include_expired: True 时也列出已结束/未开始的活动（默认只列开放中的）
+        force_refresh:   True 时忽略缓存，强制重新拉取
+    """
+    data, source = _maa_activity_fetch(force=force_refresh)
+    if data is None:
+        return ("获取活动数据失败：%s\n"
+                "可检查网络，或稍后用 force_refresh=True 重试。" % source)
+
+    client = (client or "Official").strip()
+    if client not in data:
+        return ("未知客户端 %r。可选：%s" % (client, " / ".join(sorted(data.keys()))))
+
+    info = data[client]
+    lines = ["=== %s 活动关卡（数据源：%s）===" % (client, source),
+             "查询时间：%s (UTC+8)" % datetime.now(
+                 _timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")]
+
+    def render(title, acts, key_name="Activity"):
+        """acts: {code: entry}"""
+        open_list, pending, expired, unknown = [], [], [], []
+        for code, entry in acts.items():
+            activity = entry.get(key_name) or entry
+            state, window = _maa_activity_state(activity)
+            stages = entry.get("Stages") or []
+            record = (code, activity.get("Tip") or activity.get("StageName") or code,
+                      window, stages)
+            {"open": open_list, "pending": pending,
+             "expired": expired, "unknown": unknown}[state].append(record)
+
+        out = []
+        if open_list:
+            out.append("\n● 开放中（%d 个）:" % len(open_list))
+            for code, tip, window, stages in open_list:
+                out.append("  · %s  [%s]" % (tip, code))
+                out.append("      %s" % window)
+                if stages:
+                    desc = ", ".join(
+                        "%s%s" % (s.get("Display", s.get("Value")),
+                                  ("（%s）" % s["Drop"]) if s.get("Drop") else "")
+                        for s in stages)
+                    out.append("      关卡：%s" % desc)
+        else:
+            out.append("\n● 开放中：无")
+
+        if include_expired:
+            for label, group in (("未开始", pending), ("已结束", expired),
+                                 ("时间数据异常", unknown)):
+                if group:
+                    out.append("\n○ %s（%d 个）:" % (label, len(group)))
+                    for code, tip, window, stages in group:
+                        out.append("  · %s  [%s]" % (tip, code))
+                        out.append("      %s" % window)
+        return out, len(open_list)
+
+    body, open_count = render("sideStoryStage", info.get("sideStoryStage") or {})
+    lines.extend(body)
+
+    mini = info.get("miniGame") or []
+    if mini:
+        lines.append("\n▷ 小游戏/长期玩法：")
+        for entry in mini:
+            state, window = _maa_activity_state(entry)
+            mark = {"open": "开放中", "expired": "已结束",
+                    "pending": "未开始", "unknown": "?"}[state]
+            lines.append("  · %s（%s）" % (entry.get("Display"), mark))
+            if include_expired or state == "open":
+                lines.append("      %s" % window)
+
+    rc = info.get("resourceCollection")
+    if isinstance(rc, dict):
+        state, window = _maa_activity_state(rc)
+        mark = {"open": "开放中", "expired": "已结束",
+                "pending": "未开始", "unknown": "?"}[state]
+        lines.append("\n▷ 资源收集：%s" % mark)
+        if include_expired or state == "open":
+            lines.append("      %s" % window)
+
+    if open_count:
+        lines.append("\n结论：有 %d 个活动关卡开放，可直接用于任务文件的 stage。" % open_count)
+    else:
+        lines.append("\n结论：当前没有开放的活动关卡。")
+        lines.append("      任务文件里若引用了活动关卡（如 SR-7），应改为常驻关卡：")
+        for code, why in _MAA_PERMANENT_STAGES:
+            lines.append("        %-12s %s" % (code, why))
+
+    return "\n".join(lines)
+
+
+# ── 任务控制（maa_*，兼容旧接口，底层改用 maa-cli） ─────────────
+#
+# 这四个工具保持了旧版（ctypes 直连 MaaCore.dll）的名称与用途，但实现改为
+# 调用 maa-cli，因此：
+#   · 不再需要 MaaCore.dll 与 ctypes，可在 macOS / Linux 使用
+#   · 连接不再由 Python 侧维持，maa_connect 负责环境体检并记录连接参数，
+#     真正的连接在任务运行时由 maa-cli 完成
+#   · 任务在独立进程中执行，可后台运行、查询进度、随时停止
+
+
+def _maa_adb_locator(maa_path: str = "", adb_path: str = "") -> str:
+    """定位 adb：显式参数 > PATH > MAA 安装目录自带 platform-tools。"""
+    if adb_path.strip():
+        return adb_path.strip()
+    found = shutil.which("adb")
+    if found:
+        return found
+    adb_name = "adb.exe" if os.name == "nt" else "adb"
+    for base in (maa_path, os.environ.get("MAA_DIR", "")):
+        if not base.strip():
+            continue
+        candidate = Path(base) / "platform-tools" / adb_name
+        if candidate.is_file():
+            return str(candidate)
+    return ""
+
+
+def _maa_count_devices(devices_output: str) -> int:
+    """统计 `adb devices` 输出中的设备行数（设备行为 serial<TAB>state 格式）。"""
+    count = 0
+    for line in (devices_output or "").splitlines():
+        line = line.rstrip()
+        if not line or line.startswith("List of devices"):
+            continue
+        if "\t" in line:
+            count += 1
+    return count
+
+
+def _maa_adb_run(adb: str, *args, timeout: int = 30):
+    """执行 adb 子命令，返回 (ok, 输出文本)。"""
+    try:
+        proc = subprocess.run([adb, *args], capture_output=True, timeout=timeout,
+                              creationflags=_maa_creationflags(), check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"执行 adb 失败：{exc}"
+    text = _maa_decode(proc.stdout)
+    err = _maa_decode(proc.stderr)
+    return proc.returncode == 0, (text + err).strip()
+
+
+@mcp.tool()
+def maa_connect(maa_path: str = "", adb_path: str = "", address: str = "127.0.0.1:5555",
+                config: str = "General") -> str:
+    """连接/体检 MAA 运行环境（maa-cli 后端）。
+
+    与旧版（Python 直接加载 MaaCore.dll）不同，本版通过 maa-cli 驱动 MaaCore：
+    本工具负责定位 maa-cli、检查 MaaCore 与资源是否就绪、检查 adb 设备可见性，
+    并记录后续任务要用的连接参数。真正的「连接游戏」发生在任务运行时。
+
+    参数:
+        maa_path: 可选。maa-cli 可执行文件、其所在目录，或 MAA 安装目录。
+                  留空则按 MAA_CLI_PATH 环境变量、PATH 顺序自动查找。
+        adb_path: 可选。adb 可执行文件路径，留空则用 PATH 中的 adb
+                  或 MAA 目录下的 platform-tools/adb。
+        address:  设备地址，如 "127.0.0.1:5555"（MuMu）、"127.0.0.1:7555"（雷电）。
+        config:   连接配置名。默认 "General" 表示沿用 maa-cli 的默认 profile；
+                  填其它值时会作为 --profile 传给后续任务。
+    """
+    lines = ["=== MAA 环境体检（maa-cli 后端）==="]
+
+    exe = _maa_cli_find(maa_path)
+    if not exe:
+        return _maa_cli_missing_message()
+    _maa_session["maa_cli"] = exe
+    lines.append(f"maa-cli: {exe}")
+
+    version_res = _maa_cli_exec(["version"], timeout=90, exe=exe)
+    if version_res["ok"]:
+        lines.append(version_res["out"])
+        for line in version_res["out"].splitlines():
+            if line.strip().lower().startswith("maacore"):
+                _maa_session["core_version"] = line.split()[-1]
+    else:
+        detail = version_res["err"] or version_res["out"] or "未知错误"
+        lines.append("MaaCore 尚未就绪：")
+        lines.append(detail[:600])
+        lines.append("→ 请先执行 maacli_install() 安装 MaaCore 与资源。")
+
+    device_count = 0
+    adb = _maa_adb_locator(maa_path, adb_path)
+    if not adb:
+        lines.append("adb: 未找到（跳过设备检查）。可传入 adb_path，或把 adb 加入 PATH。")
+    else:
+        lines.append(f"adb: {adb}")
+        ok, devices = _maa_adb_run(adb, "devices")
+        lines.append(devices or "（adb devices 无输出）")
+        device_count = _maa_count_devices(devices)
+
+        target = address.strip()
+        if ok and target and target not in devices and re.match(r"^[\w.\-]+:\d+$", target):
+            ok_conn, message = _maa_adb_run(adb, "connect", target)
+            lowered = message.lower()
+            connected = bool(ok_conn) and "connected to" in lowered and "cannot" not in lowered
+            lines.append(f"adb connect {target} → {'成功' if connected else '失败（设备未启动或端口不对）'}")
+            if message:
+                lines.append(message)
+            if connected:
+                ok2, devices2 = _maa_adb_run(adb, "devices")
+                if ok2:
+                    lines.append(devices2)
+        elif ok and target and target not in devices:
+            lines.append(f"提示：设备 {target} 不在 adb 设备列表中，请确认模拟器已启动。")
+
+    _maa_session["address"] = address.strip()
+    _maa_session["adb_path"] = adb
+    _maa_session["profile"] = "" if config.strip() in ("", "General") else config.strip()
+    _maa_session["connected"] = bool(_maa_session["core_version"])
+
+    lines.append("")
+    lines.append(f"本次连接参数: address={_maa_session['address'] or '(未设置)'} "
+                 f"profile={_maa_session['profile'] or '(默认)'}")
+    if _maa_session["connected"]:
+        if device_count:
+            lines.append(f"状态: 环境就绪，检测到 {device_count} 个 adb 设备，"
+                         "可以调用 maa_start_task / maacli_fight / maacli_copilot 等开始任务。")
+        else:
+            lines.append("状态: MaaCore 已就绪，但没有检测到 adb 设备。"
+                         "运行任务前请先启动模拟器，或用 maa_connect 指定正确的 address。")
+    else:
+        lines.append("状态: MaaCore 未就绪，任务暂时无法运行（先执行 maacli_install）。")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def maa_start_task(tasks: str, addr: str = "", profile: str = "") -> str:
+    """添加并启动 MAA 任务（后台运行，通过 maa-cli 执行）。
+
+    任务会交给 maa-cli 以独立进程运行，本工具立即返回作业 id，
+    再用 maa_status 查看进度、maa_stop 停止。
+
+    参数:
+        tasks: 任务配置 JSON，支持三种写法：
+               · 任务数组（旧版格式，推荐）：
+                 [{"type":"StartUp","params":{"client_type":"Official"}},
+                  {"type":"Fight","params":{"stage":"1-7","times":5}}]
+               · 单个任务对象：{"type":"Fight","params":{"stage":"1-7"}}
+               · 完整配置：{"client_type":"Official","startup":true,"tasks":[...]}
+               常用任务类型（MaaCore 任务名）：StartUp（开始唤醒）、Fight（刷理智）、
+               Recruit（自动公招）、Infrast（基建换班）、Mall（信用购物）、
+               Award（领取奖励）、Roguelike（集成战略）、Copilot（自动作业）、
+               CloseDown（关闭游戏）。参数含义见 MAA 文档（MaaCore 任务参数）。
+        addr:   设备地址，留空用 maa_connect 记录的地址
+        profile: maa-cli profile 名，留空用记录值
+    """
+    text = (tasks or "").strip()
+    if not text:
+        return "错误：tasks 为空。"
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return f"JSON 解析错误：{exc}"
+
+    if isinstance(data, list):
+        config = {"tasks": data}
+    elif isinstance(data, dict):
+        if "tasks" in data:
+            config = data
+        elif "type" in data:
+            config = {"tasks": [data]}
+        else:
+            return "错误：任务配置既没有顶层 tasks 数组，也没有 type 字段。"
+    else:
+        return "错误：tasks 必须是任务数组、单个任务对象或含 tasks 的配置对象。"
+
+    task_list = config.get("tasks") or []
+    if not isinstance(task_list, list) or not task_list:
+        return "错误：任务列表为空。"
+
+    for index, item in enumerate(task_list):
+        if not isinstance(item, dict) or not item.get("type"):
+            return f"错误：第 {index + 1} 个任务缺少 type 字段。"
+
+    task_dir = _maa_run_dir() / "tasks"
+    task_dir.mkdir(parents=True, exist_ok=True)
+    task_file = task_dir / f"task-{time.strftime('%m%d-%H%M%S')}-{uuid.uuid4().hex[:4]}.json"
+    try:
+        task_file.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        return f"写入任务文件失败：{exc}"
+
+    argv = ["run", str(task_file)]
+    argv += _maa_conn_args(addr or _maa_session["address"], profile or _maa_session["profile"])
+
+    types = " → ".join(str(item.get("type")) for item in task_list)
+    return _maa_dispatch(argv, label=f"任务: {types}", background=True)
+
+
+@mcp.tool()
+def maa_status(job_id: str = "") -> str:
+    """查询 MAA 任务状态与最近输出。
+
+    参数:
+        job_id: 作业 id（maa_start_task 或 maacli_job_start 的返回值）；
+                留空则查询最近启动的作业
+    """
+    job = _maa_job_find(job_id.strip())
+
+    lines = []
+    if _maa_session["maa_cli"]:
+        lines.append(f"maa-cli: {_maa_session['maa_cli']}")
+        lines.append(f"MaaCore: {_maa_session['core_version'] or '(未知，可用 maacli_version 查询)'}")
+        lines.append(f"连接参数: address={_maa_session['address'] or '(未设置)'} "
+                     f"profile={_maa_session['profile'] or '(默认)'}")
+
+    if job is None:
+        if job_id.strip():
+            lines.append(f"没有找到作业 {job_id}（可用 maacli_job_list 查看全部作业）。")
+        else:
+            lines.append("当前没有 MAA 任务在运行，也没有历史作业记录。")
+        return "\n".join(lines)
+
+    lines.append("")
+    lines.append(_maa_job_describe(job))
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def maa_stop(job_id: str = "") -> str:
+    """停止正在运行的 MAA 任务。
+
+    参数:
+        job_id: 作业 id；留空则停止所有正在运行的任务
+    """
+    if job_id.strip():
+        job = _maa_job_find(job_id.strip())
+        if job is None:
+            return f"没有找到作业 {job_id}。"
+        return _maa_job_stop(job)
+
+    with _maa_jobs_lock:
+        running = [job for job in _maa_jobs.values() if _maa_job_running(job)]
+    if not running:
+        return "当前没有正在运行的 MAA 任务。"
+    return "\n".join(_maa_job_stop(job) for job in running)
 
 # ══════════════════════════════════════════════════════════════════
+
+
 # CSGO/CS2 赛事数据工具（HLTV + Liquipedia + 5EPlay）
 # ══════════════════════════════════════════════════════════════════
 

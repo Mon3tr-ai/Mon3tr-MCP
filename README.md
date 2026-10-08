@@ -4,7 +4,7 @@ Hello Hello! 这里是可爱的 Mon3tr 哦，我来给博士们的 llm 赋予灵
 
 ## 我能干什么呢？
 
-帮博士终端里的 llm 理解干员档案（从 PRTS wiki ~~?现在不是在用可露希尔写的ZOOT吗?~~），解析关卡数据，查询剧情文本，生成/编辑各种文档，搜索网页，查 CSGO/CS2 赛事数据（HLTV + Liquipedia + 5EPlay），还能直接驱动 [MaaAssistantArknights](https://github.com/MaaAssistantArknights/MaaAssistantArknights) 自动挂机（开始唤醒 / 刷理智 / 公招 / 基建 / 肉鸽 / 自动作业等） ヾ(≧▽≦*)o
+帮博士终端里的 llm 理解干员档案（从 PRTS wiki ~~?现在不是在用可露希尔写的ZOOT吗?~~），解析关卡数据，查询剧情文本，生成/编辑各种文档，搜索网页，查 CSGO/CS2 赛事数据（HLTV + Liquipedia + 5EPlay），还能通过 [maa-cli](https://github.com/MaaAssistantArknights/maa-cli) 驱动 [MaaAssistantArknights](https://github.com/MaaAssistantArknights/MaaAssistantArknights) 自动挂机（开始唤醒 / 刷理智 / 公招 / 基建 / 肉鸽 / 自动作业等） ヾ(≧▽≦*)o
 
 支持的终端平台：**Windows / macOS / Linux / Android（Termux）**
 
@@ -23,6 +23,43 @@ pip install requests beautifulsoup4 mcp python-docx openpyxl pypdf reportlab pdf
 > ```bash
 > pip install requests beautifulsoup4 mcp python-docx openpyxl pypdf reportlab pdf2docx cloudscraper --break-system-packages
 > ```
+
+**MAA 相关工具需要 maa-cli（首次调用会自动下载，通常无需手动安装）**：
+
+首次用到 MAA 相关工具时，会自动从
+[MaaAssistantArknights/maa-cli releases](https://github.com/MaaAssistantArknights/maa-cli/releases)
+下载对应平台的版本，解压到 `~/.mon3tr-mcp/maa-cli/{版本}/`，之后复用缓存。
+
+| 平台 | 自动下载的资产 | 包内可执行文件 |
+|------|----------------|----------------|
+| Windows | `*-pc-windows-msvc.zip` | `maa.exe` |
+| macOS | `*-apple-darwin.tar.gz` | `maa` |
+| Linux | `*-unknown-linux-gnu.tar.gz` | `maa` |
+| Android（Termux） | ❌ 官方无预编译版本，需自行解决 | — |
+
+查找顺序：工具参数 `maa_path` → 环境变量 `MAA_CLI_PATH` → 本地已有的 maa-cli 与下载缓存中**版本最高**者 → 都没有才下载。
+
+> 若本机装有多份 maa-cli（例如 PATH 里混着旧版），会自动选版本最高的那份，不会误用旧版本。
+
+相关环境变量：
+
+| 变量 | 作用 |
+|------|------|
+| `MAA_CLI_PATH` | 指定 maa-cli 可执行文件或其所在目录（优先级高，跳过版本优选） |
+| `MAA_CLI_VERSION` | 指定自动下载的版本，如 `0.7.5`；留空取最新 |
+
+想手动安装也可以用：
+
+```bash
+# Windows（winget）
+winget install MaaAssistantArknights.maa-cli
+
+# 其它平台见 releases：
+# https://github.com/MaaAssistantArknights/maa-cli/releases
+```
+
+安装后 `maa-cli version` 应能输出版本号。首次使用前建议执行 `maa-cli install`
+（或调用 `maacli_install` 工具）安装 MaaCore 与资源。
 
 ---
 
@@ -60,6 +97,43 @@ mcp.run(transport="streamable-http")
 | `query` | str | — | 搜索关键词 |
 | `num` | int | 10 | 返回结果数量 |
 | `domain` | str | `"cn.bing.com"` | Bing 域名，可选 `cn.bing.com`（国内版）或 `www.bing.com`（国际版） |
+
+---
+
+#### `tinyfish_search` 🆕
+用 [TinyFish](https://tinyfish.ai) 托管搜索 API 搜索网页，返回标题、链接、来源和摘要。
+相比 `bing_search`：结果由服务端检索排序、带 `site_name`，中英文都更稳，并支持按来源类型 / 域名 / 时间新鲜度过滤；代价是需要配置 API Key（免 key 时请继续用 `bing_search`）。
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `query` | str | — | 搜索关键词 |
+| `num` | int | 10 | 返回结果条数（1-10，服务端单页上限 10） |
+| `domain_type` | str | `""` | 来源类型：`""` 网页 / `"news"` 新闻 / `"research_paper"` 论文 |
+| `recency_minutes` | int | 0 | 只看最近 N 分钟内发布的结果，`0` 为不限 |
+| `include_domains` | str | `""` | 只在这些域名内搜索，逗号分隔，如 `"github.com,prts.wiki"` |
+| `exclude_domains` | str | `""` | 排除这些域名，逗号分隔 |
+| `language` | str | `""` | 结果语言偏好，如 `"zh"` / `"en"`，留空由服务端判断 |
+
+**配置 API Key**（只做一次；没配也不影响其它工具，只有本工具会返回「未配置 API Key」提示）
+
+Key 在 [tinyfish.ai](https://tinyfish.ai) 免费注册获取。Search API 免费额度 **12000 次/天**（限速 30 次/分、500 次/时）。
+读取顺序：**环境变量 `TINYFISH_API_KEY` → 项目目录 `.env` → 项目目录 `.tinyfish_key`**（后者整行即 key）。
+
+```bash
+# 方式 1（推荐）：一键写入项目目录 .env，脚本会顺手 chmod 600
+./set-tinyfish-key.sh sk-tinyfish-xxxxxxxx      # Linux / macOS / Termux（不传参数则交互输入）
+set-tinyfish-key.bat sk-tinyfish-xxxxxxxx       # Windows
+
+# 方式 2：手动写
+cp .env.example .env && vi .env                 # 只填 TINYFISH_API_KEY 那一行
+
+# 方式 3：交给服务管理器（容器 / 托管部署更合适，不必落地文件）
+#   systemd : Environment=TINYFISH_API_KEY=sk-...  或  EnvironmentFile=/path/.env
+#   launchd : 写进 plist 的 EnvironmentVariables 段
+```
+
+> `.env` 与 `.tinyfish_key` 已在 `.gitignore` 中，key 不会被提交。
+> 改完记得重启 Mon3tr-MCP 进程（systemd：`systemctl restart Mon3tr-MCP`）。
 
 ---
 
@@ -462,28 +536,85 @@ csgo_match_detail("2394896", source="5eplay")
 
 ---
 
-### MAA 自动化控制
+### MAA 自动化控制（maa-cli 后端）
 
-> 通过 ctypes 加载 [MaaAssistantArknights](https://github.com/MaaAssistantArknights/MaaAssistantArknights) 的 `MaaCore.dll`，让 llm 直接驱动 MAA 挂机。仅 **Windows** 可用（依赖 `MaaCore.dll`），无需额外 pip 包（仅用标准库 `ctypes`/`threading`）。
+> 通过 [maa-cli](https://github.com/MaaAssistantArknights/maa-cli) 驱动
+> [MaaAssistantArknights](https://github.com/MaaAssistantArknights/MaaAssistantArknights)，
+> 让 llm 直接驱动 MAA 挂机（开始唤醒 / 刷理智 / 公招 / 基建 / 肉鸽 / 自动作业等）。
+
+与旧版（Python 用 `ctypes` 加载 `MaaCore.dll`）相比：
+
+- **跨平台**：Windows / macOS / Linux 走同一套 maa-cli 命令
+- Python 侧不再加载动态库，也无需 `ctypes`
+- 复用 maa-cli 的 profile 配置、资源安装与日志管理
+- 任务在独立进程中运行，可后台执行、查询进度、随时停止
+
+> maa-cli 定位顺序：工具参数 `maa_path` > 环境变量 `MAA_CLI_PATH` > `PATH` 中的 `maa-cli` / `maa`。
+
+#### 环境与版本
+
+| 工具 | 主要参数 | 说明 |
+|------|----------|------|
+| `maacli_version` | `component` | 查看 maa-cli / MaaCore 版本 |
+| `maacli_install` | `channel`, `no_resource`, `force`, `background`, `timeout` | 安装 MaaCore 与资源（首次使用） |
+| `maacli_update` | `background`, `timeout` | 更新 MaaCore 与资源 |
+| `maacli_hot_update` | `background`, `timeout` | 热更新资源（MaaResource） |
+| `maacli_dir` | `dir_name` | 查看 data / library / config / cache / resource / hot-update / log 目录 |
+| `maacli_list` | — | 列出配置目录中可用的自定义任务 |
+| `maacli_help` | `command` | 查询任意 maa-cli 子命令的参数说明 |
+| `maacli_activity` | `client` | 查看指定客户端的关卡开放情况 |
+| `maacli_remainder` | `divisor`, `timezone` | 计算日期余数（写任务条件用） |
+| `maacli_cleanup` | `targets` | 清理缓存与日志 |
+
+#### 任务控制
+
+| 工具 | 主要参数 | 说明 |
+|------|----------|------|
+| `maacli_startup` | `client_type`, `account_name`, `addr`, `profile`, `background` | 开始唤醒并进入主界面 |
+| `maacli_closedown` | `client`, `addr`, `profile`, `background` | 在游戏内退出账号 |
+| `maacli_fight` | `stage`, `medicine`, `expiring_medicine`, `stone`, `times`, `drops`, `series`, `background` | 刷理智 |
+| `maacli_copilot` | `uris`, `raid`, `formation`, `use_sanity_potion`, `background` | 运行自动作业（本地 JSON / `maa://编号` / 作业集） |
+| `maacli_run` | `args`, `label`, `addr`, `profile`, `background`, `timeout` | 运行任意 maa-cli 命令（通用入口） |
+
+#### 后台作业
+
+| 工具 | 主要参数 | 说明 |
+|------|----------|------|
+| `maacli_job_start` | `args`, `label`, `addr`, `profile` | 后台启动任意命令，立即返回作业 id |
+| `maacli_job_status` | `job_id` | 查看进度、任务摘要与 maa-cli 日志尾部 |
+| `maacli_job_list` | — | 列出本次会话启动过的所有作业 |
+| `maacli_job_stop` | `job_id` | 停止作业；留空则停止全部运行中的作业 |
+
+#### 配置与文件
+
+| 工具 | 主要参数 | 说明 |
+|------|----------|------|
+| `maacli_import` | `path`, `name`, `config_type`, `force` | 导入任务 / profile / 基建 / 作业文件（支持 URL） |
+| `maacli_init` | `name`, `format`, `force` | 初始化 profile 模板 |
+| `maacli_convert` | `input`, `output`, `format` | TOML / YAML / JSON 互转 |
+
+---
 
 #### `maa_connect`
-连接 MAA 到模拟器/设备。首次调用时加载 `MaaCore.dll` 并初始化资源。
+连接/体检 MAA 运行环境：定位 maa-cli、检查 MaaCore 与资源是否就绪、检查 adb 设备可见性，并记录后续任务要用的连接参数。真正的「连接游戏」发生在任务运行时。
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `maa_path` | str | — | MAA 安装目录（需含 `MaaCore.dll` 和 `resource/`），如 `C:/MAA` |
-| `adb_path` | str | `""` | adb 路径，留空则自动查找 MAA 自带的 `platform-tools/adb.exe` |
+| `maa_path` | str | `""` | maa-cli 可执行文件、其所在目录，或 MAA 安装目录；留空则自动查找 |
+| `adb_path` | str | `""` | adb 路径，留空则用 `PATH` 中的 adb 或 MAA 目录下的 `platform-tools/adb` |
 | `address` | str | `"127.0.0.1:5555"` | 设备地址，如 `127.0.0.1:5555`（MuMu）、`127.0.0.1:7555`（雷电） |
-| `config` | str | `"General"` | 连接配置名 |
+| `config` | str | `"General"` | 连接配置名；非 `General` 时作为 `--profile` 传给后续任务 |
 
 ---
 
 #### `maa_start_task`
-添加并启动 MAA 任务，可一次添加多个任务按顺序执行。
+用 MaaCore 任务名启动任务串。任务会写入 maa-cli 任务文件并**在后台执行**，本工具立即返回作业 id。
 
 | 参数 | 类型 | 说明 |
 |------|------|------|
-| `tasks` | str | 任务配置 JSON 数组，每个元素 `{"type": "...", "params": {...}}` |
+| `tasks` | str | 任务配置 JSON：任务数组、单个任务对象，或含 `tasks` 的完整配置 |
+| `addr` | str | 设备地址，留空用 `maa_connect` 记录的地址 |
+| `profile` | str | maa-cli profile 名 |
 
 支持的任务类型：
 
@@ -506,13 +637,21 @@ maa_start_task('[{"type":"StartUp","params":{"client_type":"Official"}},{"type":
 
 ---
 
-#### `maa_stop`
-停止当前所有 MAA 任务。无需参数。
+#### `maa_status`
+查询任务状态、最近输出与 maa-cli 日志尾部。
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `job_id` | str | 作业 id；留空则查询最近启动的作业 |
 
 ---
 
-#### `maa_status`
-查询 MAA 当前状态（运行中/空闲、连接状态）和最近 20 条回调日志。无需参数。
+#### `maa_stop`
+停止正在运行的 MAA 任务（先尝试优雅停止，超时后强制终止）。
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `job_id` | str | 作业 id；留空则停止所有正在运行的作业 |
 
 ---
 

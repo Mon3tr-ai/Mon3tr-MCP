@@ -1,5 +1,7 @@
 __pycache__/
 logs/
+.env
+.tinyfish_key
 start-hidden.bat
 start-hidden.vbs
 stop-service.bat
